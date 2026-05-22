@@ -1,0 +1,238 @@
+{
+  "users": [
+    {
+      "id": "b346df4e-271e-4224-8cc9-63c62e3146a9",
+      "name": "Sam chuvi",
+      "username": "samchuvi",
+      "password": "$2b$10$Anl9Uf09lvh9KulaWCFCdOZ77v4Y.YhcowoN7Ay/MClgrpW4sa9BO",
+      "role": "admin",
+      "status": "active",
+      "createdAt": "2026-05-21T06:44:43.975Z"
+    },
+    {
+      "id": "f9cd8c42-13f8-43d0-b23b-769f8e277181",
+      "name": "Daisy Joy",
+      "username": "daisy",
+      "password": "$2b$10$.tLN8Ue5MGDJPS0kIivxf.0TtPHszTNyJhhq0rV/e5MQ9FxhmLe0C",
+      "role": "receptionist",
+      "status": "active",
+      "createdAt": "2026-05-21T06:46:39.983Z"
+    },
+    {
+      "id": "b53fea0d-e5e1-4211-afe0-fbbfb6681af8",
+      "name": "Jacky Chan",
+      "username": "jacky",
+      "password": "$2b$10$ZWThzSSy069CUH9LYurQ6.yZM4iFaukSU2PovgBS.EtCDR.2hroVK",
+      "role": "doctor",
+      "status": "active",
+      "createdAt": "2026-05-21T06:47:38.944Z"
+    },
+    {
+      "id": "0abe0b4b-0940-49be-a11b-b170aeb3ea43",
+      "name": "Mave Slamite",
+      "username": "mave",
+      "role": "pharmacist",
+      "password": "$2b$10$ZjAxZ9oP78p5dcf15Hlyx.vgh/u22s2SlPdTSill9BL2WBWGVSpN2",
+      "status": "active",
+      "createdAt": "2026-05-21T06:50:03.805Z"
+    }
+  ],
+  "patients": [
+    {
+      "id": "a54534ff-1f96-466e-9e49-a3bf4fbfaff1",
+      "name": "Sabrin",
+      "age": "21",
+      "gender": "Female",
+      "bloodGroup": "B+",
+      "phone": "0752884347",
+      "email": "chuvisam1@gmail.com",
+      "address": "Bukere main street",
+      "emergencyContact": "0776544321",
+      "createdAt": "2026-05-21T06:30:04.881Z"
+    },
+    {
+      "id": "94614794-8c2c-462a-bdef-232db07011a0",
+      "name": "Isaac Yakob",
+      "age": "20",
+      "gender": "Male",
+      "bloodGroup": "B+",
+      "phone": "0766655242",
+      "email": "chuvisam1@gmail.com",
+      "address": "Gagba road",
+      "emergencyContact": "0883377222",
+      "createdAt": "2026-05-21T07:07:33.269Z"
+    }
+  ],
+  "doctors": [
+    {
+      "id": "aad6a90f-f0dc-4677-a55a-23c72592c915",
+      "name": "Furaha Prisca",
+      "specialization": "Gynechologist",
+      "qualification": "Bachelors in Gynechology ",
+      "department": "Health",
+      "phone": "0781495665",
+      "linkedUserId": "D1",
+      "createdAt": "2026-05-21T06:22:35.039Z"
+    }
+  ],
+  "staff": [
+    {
+      "id": "33edf7be-aac3-45d1-b213-3dee1009da62",
+      "name": "Nafa Mohamed",
+      "role": "Gynechologist",
+      "department": "Medical",
+      "phone": "0784556200",
+      "salary": "201",
+      "createdAt": "2026-05-19T09:35:42.763Z"
+    },
+    {
+      "id": "304edcb7-fd7d-4ac7-b458-900d41fbf15c",
+      "name": "Sam Chuvi",
+      "role": "Receptionist",
+      "phone": "0784466700",
+      "salary": "132",
+      "department": "Reception",
+      "createdAt": "2026-05-21T06:24:38.464Z"
+    },
+    {
+      "id": "461151ac-a4bc-4047-b0e3-61a18f075ea9",
+      "role": "Pharmacist ",
+      "name": "Esther Fashion",
+      "department": "Pharmacy",
+      "phone": "07566332001",
+      "salary": "33",
+      "createdAt": "2026-05-21T06:26:52.573Z"
+    }
+  ],
+  "appointments": [
+    {
+      "id": "65a3a135-0813-4f58-9369-6969bf9d20c5",
+      "patientId": "94614794-8c2c-462a-bdef-232db07011a0",
+      "doctorId": "aad6a90f-f0dc-4677-a55a-23c72592c915",
+      "date": "2026-05-21",
+      "time": "01:10",
+      "reason": "Severe stomach pain",
+      "status": "scheduled",
+      "createdAt": "2026-05-21T07:11:19.330Z"
+    }
+  ],
+  "medicalRecords": [
+    {
+      "id": "a94836d1-d49d-4a76-9c8b-887e3a2b2179",
+      "medicinesUsed": [],
+      "doctorId": "aad6a90f-f0dc-4677-a55a-23c72592c915",
+      "diagnosis": "yfyy",
+      "treatment": "hyfyi",
+      "prescription": "jguog",
+      "createdBy": "u1",
+      "createdAt": "2026-05-21T06:28:47.378Z"
+    },
+    {
+      "id": "60cee2a9-435d-4d9a-a538-99d6896af97c",
+      "medicinesUsed": [
+        "0fdfb4e2-25b1-44ea-9c64-ebfbed5bd58e"
+      ],
+      "patientId": "a54534ff-1f96-466e-9e49-a3bf4fbfaff1",
+      "doctorId": "aad6a90f-f0dc-4677-a55a-23c72592c915",
+      "diagnosis": "Headech",
+      "treatment": "paracetamol table",
+      "prescription": "2*3",
+      "createdBy": "b53fea0d-e5e1-4211-afe0-fbbfb6681af8",
+      "createdAt": "2026-05-21T07:03:01.893Z"
+    }
+  ],
+  "prescriptions": [],
+  "inventory": [
+    {
+      "id": "0fdfb4e2-25b1-44ea-9c64-ebfbed5bd58e",
+      "name": "Paracetatol",
+      "category": "Medicine",
+      "quantity": "10",
+      "unit": "3",
+      "expiryDate": "2027-01-06",
+      "supplier": "Spring pharmacy",
+      "createdAt": "2026-05-21T06:57:54.493Z"
+    }
+  ],
+  "bills": [
+    {
+      "id": "31ec6b40-327f-4178-994d-57e79e5dd9f1",
+      "billNumber": "BILL-1779345082928",
+      "items": [
+        {
+          "desc": "",
+          "amount": "81"
+        }
+      ],
+      "patientId": "a54534ff-1f96-466e-9e49-a3bf4fbfaff1",
+      "total": 81,
+      "status": "paid",
+      "createdAt": "2026-05-21T06:31:22.928Z"
+    },
+    {
+      "id": "5d29de69-3486-4923-9c3d-a10833f25c5a",
+      "billNumber": "BILL-1779347335935",
+      "items": [
+        {
+          "desc": "Treatment",
+          "amount": "150000"
+        }
+      ],
+      "patientId": "94614794-8c2c-462a-bdef-232db07011a0",
+      "notes": "For the malaria treatment",
+      "total": 150000,
+      "status": "paid",
+      "createdAt": "2026-05-21T07:08:55.935Z"
+    },
+    {
+      "id": "e23c7af0-2351-401e-b491-a29fffb7dc39",
+      "billNumber": "BILL-1779366187997",
+      "items": [
+        {
+          "desc": "paracetamol",
+          "amount": "50000"
+        }
+      ],
+      "patientId": "94614794-8c2c-462a-bdef-232db07011a0",
+      "notes": "cleared the balance",
+      "total": 50000,
+      "status": "paid",
+      "createdAt": "2026-05-21T12:23:07.997Z"
+    }
+  ],
+  "transactions": [
+    {
+      "id": "2c3a2fa1-5e3f-4c88-80e8-d732e5e24aa2",
+      "txRef": "TXN-1779347264331",
+      "billId": "31ec6b40-327f-4178-994d-57e79e5dd9f1",
+      "amount": 81,
+      "patientId": "a54534ff-1f96-466e-9e49-a3bf4fbfaff1",
+      "method": "Cash",
+      "note": "Manual payment",
+      "recordedBy": "Daisy Joy",
+      "createdAt": "2026-05-21T07:07:44.331Z"
+    },
+    {
+      "id": "cf4d3109-f2d3-464c-a160-e29ffd8fa251",
+      "txRef": "TXN-1779347339516",
+      "billId": "5d29de69-3486-4923-9c3d-a10833f25c5a",
+      "amount": 150000,
+      "patientId": "94614794-8c2c-462a-bdef-232db07011a0",
+      "method": "Cash",
+      "note": "Manual payment",
+      "recordedBy": "Daisy Joy",
+      "createdAt": "2026-05-21T07:08:59.516Z"
+    },
+    {
+      "id": "aef2b656-854b-47a8-8d39-dc21ca3b0d96",
+      "txRef": "TXN-1779366200073",
+      "billId": "e23c7af0-2351-401e-b491-a29fffb7dc39",
+      "amount": 50000,
+      "patientId": "94614794-8c2c-462a-bdef-232db07011a0",
+      "method": "Cash",
+      "note": "Manual payment",
+      "recordedBy": "Daisy Joy",
+      "createdAt": "2026-05-21T12:23:20.074Z"
+    }
+  ]
+}
