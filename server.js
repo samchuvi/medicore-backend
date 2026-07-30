@@ -47,8 +47,11 @@ const DoctorSchema = new mongoose.Schema({
   id: { type: String, default: () => uuidv4() },
   name: String,
   specialization: String,
+  qualification: String,
+  department: String,
   phone: String,
   email: String,
+  status: String,
   linkedUserId: String,
   createdAt: { type: String, default: () => new Date().toISOString() },
 });
@@ -61,6 +64,8 @@ const StaffSchema = new mongoose.Schema({
   phone: String,
   email: String,
   department: String,
+  salary: String,
+  status: String,
   createdAt: { type: String, default: () => new Date().toISOString() },
 });
 const Staff = mongoose.model('Staff', StaffSchema);
@@ -74,6 +79,7 @@ const AppointmentSchema = new mongoose.Schema({
   date: String,
   time: String,
   status: { type: String, default: 'scheduled' },
+  reason: String,
   notes: String,
   createdAt: { type: String, default: () => new Date().toISOString() },
 });
@@ -86,8 +92,10 @@ const MedicalRecordSchema = new mongoose.Schema({
   doctorId: String,
   doctorName: String,
   diagnosis: String,
+  treatment: String,
   prescription: String,
   medicines: Array,
+  medicinesUsed: Array,
   notes: String,
   createdBy: String,
   createdAt: { type: String, default: () => new Date().toISOString() },
@@ -129,6 +137,8 @@ const TransactionSchema = new mongoose.Schema({
   amount: String,
   paymentMethod: String,
   recordedBy: String,
+  method: String,
+  note: String,
   createdAt: { type: String, default: () => new Date().toISOString() },
 });
 const Transaction = mongoose.model('Transaction', TransactionSchema);
