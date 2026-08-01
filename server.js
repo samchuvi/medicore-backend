@@ -464,6 +464,8 @@ app.post('/api/transactions', auth, requireRole(ADMIN, RECEPTIONIST), async (req
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.delete('/api/transactions/:id',auth,requireRole(ADMIN),async(req,res)=>{try{await Transaction.findOneAndDelete({id:req.params.id});res.json({success:true});}catch(err){res.status(500).json({error:err.message});}});
+
 // ─── DASHBOARD STATS ──────────────────────────────────────────────────────────
 
 app.get('/api/stats', auth, async (req, res) => {
