@@ -8,16 +8,62 @@ const { v4: uuidv4 } = require('uuid');
 const { connect } = require('./db');
 
 const app = express();
-const SECRET = process.env.JWT_SECRET || 'medicore_hms_super_secret_2024';
+
+// The signing key MUST come from the environment. Refusing to start without it
+// prevents anyone from forging tokens against a well-known default secret.
+const SECRET = process.env.JWT_SECRET;
+if (!SECRET || SECRET.length < 16) {
+  console.error('❌ JWT_SECRET is missing or too short. Set a long random value in the environment before starting.');
+  process.exit(1);
+}
+
 const SUPERADMIN = 'superadmin';
 const ADMIN = 'admin';
 const DOCTOR = 'doctor';
 const RECEPTIONIST = 'receptionist';
 const PHARMACIST = 'pharmacist';
 
-app.use(cors());
+// ─── CORS ────────────────────────────────────────────────────────────────────
+// Set CORS_ORIGINS to a comma-separated allow-list (e.g. the deployed frontend
+// URL). If it is not set we fall back to reflecting any origin, but warn loudly
+// because that should never be the case in production.
+const rawOrigins = process.env.CORS_ORIGINS;
+if (rawOrigins) {
+  const allowed = rawOrigins.split(',').map(s => s.trim()).filter(Boolean);
+  app.use(cors({ origin: (origin, cb) => cb(null, !origin || allowed.includes(origin)) }));
+} else {
+  console.warn('⚠️  CORS_ORIGINS not set — every origin is allowed. Set CORS_ORIGINS in production.');
+  app.use(cors());
+}
+
 app.use(express.json());
 app.set('trust proxy', true);
+
+// ─── LOGIN RATE LIMIT ────────────────────────────────────────────────────────
+// Simple in-memory throttle: at most LOGIN_MAX_ATTEMPTS failed-or-not attempts
+// per IP per window. Enough to blunt online brute-force without a dependency.
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS = 10;
+const loginHits = new Map();
+
+setInterval(() => {
+  const cutoff = Date.now() - LOGIN_WINDOW_MS;
+  for (const [key, hit] of loginHits) if (hit.first < cutoff) loginHits.delete(key);
+}, LOGIN_WINDOW_MS).unref();
+
+function loginRateLimit(req, res, next) {
+  const key = req.ip || 'unknown';
+  const now = Date.now();
+  const hit = loginHits.get(key);
+  if (!hit || now - hit.first > LOGIN_WINDOW_MS) {
+    loginHits.set(key, { count: 1, first: now });
+    return next();
+  }
+  hit.count += 1;
+  if (hit.count > LOGIN_MAX_ATTEMPTS)
+    return res.status(429).json({ error: 'Too many login attempts. Please wait a few minutes and try again.' });
+  next();
+}
 
 // ─── MONGOOSE SCHEMAS ────────────────────────────────────────────────────────
 
@@ -35,12 +81,14 @@ const User = mongoose.model('User', UserSchema);
 const PatientSchema = new mongoose.Schema({
   id: { type: String, default: () => uuidv4() },
   name: String,
-  age: String,
+  age: Number,
   gender: String,
   phone: String,
+  email: String,
   address: String,
   bloodGroup: String,
   emergencyContact: String,
+  notes: String,
   createdAt: { type: String, default: () => new Date().toISOString() },
 });
 const Patient = mongoose.model('Patient', PatientSchema);
@@ -66,7 +114,7 @@ const StaffSchema = new mongoose.Schema({
   phone: String,
   email: String,
   department: String,
-  salary: String,
+  salary: Number,
   status: String,
   createdAt: { type: String, default: () => new Date().toISOString() },
 });
@@ -108,9 +156,9 @@ const InventorySchema = new mongoose.Schema({
   id: { type: String, default: () => uuidv4() },
   name: String,
   category: String,
-  quantity: String,
+  quantity: Number,
   unit: String,
-  price: String,
+  unitPrice: Number,
   expiryDate: String,
   supplier: String,
   createdAt: { type: String, default: () => new Date().toISOString() },
@@ -123,10 +171,11 @@ const BillSchema = new mongoose.Schema({
   patientId: String,
   patientName: String,
   items: Array,
-  totalAmount: String,
+  totalAmount: { type: Number, default: 0 },
   paidAmount: { type: Number, default: 0 },
-  remainingAmount: Number,
+  remainingAmount: { type: Number, default: 0 },
   status: { type: String, default: 'pending' },
+  notes: String,
   createdAt: { type: String, default: () => new Date().toISOString() },
 });
 const Bill = mongoose.model('Bill', BillSchema);
@@ -135,9 +184,9 @@ const TransactionSchema = new mongoose.Schema({
   id: { type: String, default: () => uuidv4() },
   txRef: String,
   billId: String,
+  patientId: String,
   patientName: String,
-  amount: String,
-  paymentMethod: String,
+  amount: { type: Number, default: 0 },
   recordedBy: String,
   method: String,
   note: String,
@@ -250,14 +299,31 @@ async function protectSuperAdmin(req, res, next) {
   } catch (err) { res.status(500).json({ error: err.message }); }
 }
 
+// Guard the `role` field on user create / update so an ordinary admin cannot
+// mint (or promote themselves to) a super admin, and cannot set a bogus role.
+const ASSIGNABLE_ROLES = new Set([ADMIN, DOCTOR, RECEPTIONIST, PHARMACIST]);
+function sanitizeUserRole(req, res, next) {
+  const { role } = req.body;
+  if (role === undefined || role === null || role === '') return next();
+  if (role === SUPERADMIN) {
+    if (req.user.role !== SUPERADMIN)
+      return res.status(403).json({ error: 'Only a super admin can assign the super admin role' });
+    return next();
+  }
+  if (!ASSIGNABLE_ROLES.has(role))
+    return res.status(400).json({ error: `Invalid role: ${role}` });
+  next();
+}
+
 // ─── LOGIN ───────────────────────────────────────────────────────────────────
 
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', loginRateLimit, async (req, res) => {
   try {
     const { username, password } = req.body;
     const user = await User.findOne({ username, status: { $ne: 'inactive' } });
-    if (!user || !bcrypt.compareSync(password, user.password))
+    if (!user || !user.password || !(await bcrypt.compare(password || '', user.password)))
       return res.status(401).json({ error: 'Invalid credentials' });
+    loginHits.delete(req.ip || 'unknown');
     const token = jwt.sign({ id: user.id, role: user.role, name: user.name }, SECRET, { expiresIn: '8h' });
     res.json({ token, user: { id: user.id, name: user.name, role: user.role, username: user.username } });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -272,14 +338,15 @@ app.get('/api/users', auth, requireRole(ADMIN), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/users', auth, requireRole(ADMIN), async (req, res) => {
+app.post('/api/users', auth, requireRole(ADMIN), sanitizeUserRole, async (req, res) => {
   try {
+    if (!req.body.password) return res.status(400).json({ error: 'A password is required' });
     const exists = await User.findOne({ username: req.body.username });
     if (exists) return res.status(400).json({ error: 'Username already exists' });
     const user = new User({
       ...req.body,
       id: uuidv4(),
-      password: bcrypt.hashSync(req.body.password, 10),
+      password: await bcrypt.hash(req.body.password, 10),
       status: 'active',
     });
     await user.save();
@@ -289,10 +356,13 @@ app.post('/api/users', auth, requireRole(ADMIN), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put('/api/users/:id', auth, requireRole(ADMIN), protectSuperAdmin, async (req, res) => {
+app.put('/api/users/:id', auth, requireRole(ADMIN), protectSuperAdmin, sanitizeUserRole, async (req, res) => {
   try {
     const update = { ...req.body };
-    if (req.body.password) update.password = bcrypt.hashSync(req.body.password, 10);
+    delete update.id;
+    delete update._id;
+    if (req.body.password) update.password = await bcrypt.hash(req.body.password, 10);
+    else delete update.password;
     const user = await User.findOneAndUpdate({ id: req.params.id }, update, { new: true, projection: { password: 0 } });
     if (!user) return res.status(404).json({ error: 'Not found' });
     res.json(user);
@@ -308,7 +378,7 @@ app.put('/api/users/:id/password', auth, requireRole(ADMIN), protectSuperAdmin, 
     const generated = !req.body.password;
     const newPassword = req.body.password
       || `Hms-${Math.random().toString(36).slice(-8)}${Math.floor(Math.random() * 90 + 10)}`;
-    target.password = bcrypt.hashSync(newPassword, 10);
+    target.password = await bcrypt.hash(newPassword, 10);
     await target.save();
     res.json({ success: true, generated, password: generated ? newPassword : undefined });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -394,7 +464,7 @@ app.delete('/api/patients/:id', auth, requireRole(ADMIN), async (req, res) => {
 
 // ─── DOCTORS ─────────────────────────────────────────────────────────────────
 
-app.get('/api/doctors', auth, async (req, res) => {
+app.get('/api/doctors', auth, requireRole(ADMIN, RECEPTIONIST, DOCTOR), async (req, res) => {
   try { res.json(await Doctor.find()); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -454,11 +524,14 @@ app.delete('/api/staff/:id', auth, requireRole(ADMIN), async (req, res) => {
 
 app.get('/api/appointments', auth, requireRole(ADMIN, RECEPTIONIST, DOCTOR), async (req, res) => {
   try {
+    const filter = {};
     if (req.user.role === DOCTOR) {
       const doc = await Doctor.findOne({ linkedUserId: req.user.id });
-      return res.json(doc ? await Appointment.find({ doctorId: doc.id }) : await Appointment.find());
+      // A doctor only ever sees their own appointments. If their login is not
+      // linked to a doctor record yet, they see nothing rather than everything.
+      filter.doctorId = doc ? doc.id : '__no_linked_doctor__';
     }
-    res.json(await Appointment.find());
+    res.json(await Appointment.find(filter));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -492,7 +565,8 @@ app.get('/api/records', auth, requireRole(ADMIN, DOCTOR, RECEPTIONIST), async (r
     const filter = patientId ? { patientId } : {};
     if (req.user.role === DOCTOR) {
       const doc = await Doctor.findOne({ linkedUserId: req.user.id });
-      if (doc) filter.doctorId = doc.id;
+      // Same rule as appointments: an unlinked doctor login sees no records.
+      filter.doctorId = doc ? doc.id : '__no_linked_doctor__';
     }
     res.json(await MedicalRecord.find(filter));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -551,13 +625,15 @@ app.get('/api/bills', auth, requireRole(ADMIN, RECEPTIONIST), async (req, res) =
 
 app.post('/api/bills', auth, requireRole(ADMIN, RECEPTIONIST), async (req, res) => {
   try {
-    const totalAmount = parseFloat(req.body.totalAmount) || 0;
+    const { total, totalAmount: bodyTotal, ...rest } = req.body;
+    const totalAmount = Number(bodyTotal ?? total) || 0;
     const b = new Bill({
-      ...req.body,
+      ...rest,
       id: uuidv4(),
       billNumber: `BILL-${Date.now()}`,
       status: 'pending',
       paidAmount: 0,
+      totalAmount,
       remainingAmount: totalAmount,
     });
     await b.save(); res.json(b);
@@ -581,8 +657,16 @@ app.get('/api/transactions', auth, requireRole(ADMIN, RECEPTIONIST), async (req,
 
 app.post('/api/transactions', auth, requireRole(ADMIN, RECEPTIONIST), async (req, res) => {
   try {
+    const amount = Number(req.body.amount) || 0;
+    let patientName = req.body.patientName;
+    if (!patientName && req.body.patientId) {
+      const p = await Patient.findOne({ id: req.body.patientId });
+      patientName = p?.name;
+    }
     const tx = new Transaction({
       ...req.body,
+      amount,
+      patientName,
       id: uuidv4(),
       txRef: `TXN-${Date.now()}`,
       recordedBy: req.user.name,
@@ -594,8 +678,8 @@ app.post('/api/transactions', auth, requireRole(ADMIN, RECEPTIONIST), async (req
       const bill = await Bill.findOne({ id: req.body.billId });
       if (bill) {
         const allTx = await Transaction.find({ billId: req.body.billId });
-        const totalPaid = allTx.reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
-        const totalAmount = parseFloat(bill.totalAmount) || 0;
+        const totalPaid = allTx.reduce((s, t) => s + (Number(t.amount) || 0), 0);
+        const totalAmount = Number(bill.totalAmount) || 0;
         const remaining = totalAmount - totalPaid;
         await Bill.findOneAndUpdate({ id: req.body.billId }, {
           paidAmount: totalPaid,
@@ -722,11 +806,12 @@ async function seedAdmin() {
       id: uuidv4(),
       name: 'Administrator',
       username: 'admin',
-      password: bcrypt.hashSync('password', 10),
+      password: await bcrypt.hash('password', 10),
       role: 'admin',
       status: 'active',
     }).save();
     console.log('✅ Default admin created — username: admin / password: password');
+    console.warn('⚠️  Change the default admin password immediately after first login.');
   }
 }
 
@@ -745,15 +830,24 @@ async function seedSuperAdmin() {
       id: uuidv4(),
       name,
       username,
-      password: bcrypt.hashSync(password, 10),
+      password: await bcrypt.hash(password, 10),
       role: SUPERADMIN,
       status: 'active',
     }).save();
     console.log(`✅ Super admin created — username: ${username}`);
-  } else if (existing.role !== SUPERADMIN) {
-    existing.role = SUPERADMIN;
-    await existing.save();
-    console.log(`✅ Existing user "${username}" promoted to super admin`);
+  } else {
+    if (existing.role !== SUPERADMIN) {
+      existing.role = SUPERADMIN;
+      console.log(`✅ Existing user "${username}" promoted to super admin`);
+    }
+    // Rotate the super admin password on boot when explicitly asked to. Use this
+    // once (with a fresh SUPERADMIN_PASSWORD) to recover from a leaked value,
+    // then unset the flag.
+    if (process.env.SUPERADMIN_RESET_PASSWORD === 'true') {
+      existing.password = await bcrypt.hash(password, 10);
+      console.log(`✅ Super admin "${username}" password reset from environment`);
+    }
+    if (existing.isModified()) await existing.save();
   }
 }
 
