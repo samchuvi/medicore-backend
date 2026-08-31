@@ -16,3 +16,6 @@ npm-debug.log*
 .DS_Store
 .vscode/
 .idea/
+
+# legacy JSON store — unused by the Mongoose server, contains PII + hashes
+data.json
