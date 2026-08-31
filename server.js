@@ -9,6 +9,7 @@ const { connect } = require('./db');
 
 const app = express();
 const SECRET = process.env.JWT_SECRET || 'medicore_hms_super_secret_2024';
+const SUPERADMIN = 'superadmin';
 const ADMIN = 'admin';
 const DOCTOR = 'doctor';
 const RECEPTIONIST = 'receptionist';
@@ -16,6 +17,7 @@ const PHARMACIST = 'pharmacist';
 
 app.use(cors());
 app.use(express.json());
+app.set('trust proxy', true);
 
 // ─── MONGOOSE SCHEMAS ────────────────────────────────────────────────────────
 
@@ -143,6 +145,82 @@ const TransactionSchema = new mongoose.Schema({
 });
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 
+const AuditLogSchema = new mongoose.Schema({
+  id: { type: String, default: () => uuidv4() },
+  timestamp: { type: String, default: () => new Date().toISOString() },
+  actorId: String,
+  actorName: String,
+  actorRole: String,
+  action: String,          // CREATE | UPDATE | DELETE | LOGIN | LOGIN_FAILED | PASSWORD_RESET | ACCOUNT_DISABLED | ACCOUNT_ENABLED
+  entity: String,          // patients | users | appointments | auth | ...
+  entityId: String,
+  method: String,
+  path: String,
+  status: Number,
+  description: String,
+  ip: String,
+  meta: mongoose.Schema.Types.Mixed,
+});
+const AuditLog = mongoose.model('AuditLog', AuditLogSchema);
+
+async function writeAudit(entry) {
+  try { await new AuditLog({ id: uuidv4(), ...entry }).save(); }
+  catch (e) { console.error('⚠️  audit write failed:', e.message); }
+}
+
+// ─── AUDIT TRAIL ─────────────────────────────────────────────────────────────
+// Every state-changing request (and every login attempt) is recorded, including
+// the ones made by the super admin.
+
+const AUDITED_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+function deriveAction(req, statusCode) {
+  if (req.path === '/api/login') return statusCode < 400 ? 'LOGIN' : 'LOGIN_FAILED';
+  if (/\/password$/.test(req.path)) return 'PASSWORD_RESET';
+  if (req.method === 'POST') return 'CREATE';
+  if (req.method === 'DELETE') return 'DELETE';
+  if ((req.method === 'PUT' || req.method === 'PATCH')) {
+    const s = req.body && req.body.status;
+    if (s === 'inactive') return 'ACCOUNT_DISABLED';
+    if (s === 'active') return 'ACCOUNT_ENABLED';
+    return 'UPDATE';
+  }
+  return req.method;
+}
+
+app.use((req, res, next) => {
+  if (!AUDITED_METHODS.has(req.method) || !req.path.startsWith('/api/')) return next();
+
+  const safeBody = req.body && typeof req.body === 'object' ? { ...req.body } : {};
+  if ('password' in safeBody) safeBody.password = '***';
+
+  const originalJson = res.json.bind(res);
+  res.json = (data) => { res.locals.responseBody = data; return originalJson(data); };
+
+  res.on('finish', () => {
+    const seg = req.path.split('/').filter(Boolean);      // ['api', 'patients', ':id']
+    const isAuth = req.path === '/api/login';
+    const entity = isAuth ? 'auth' : (seg[1] || 'unknown');
+    const entityId = seg[2] || res.locals.responseBody?.id || undefined;
+    writeAudit({
+      actorId: req.user?.id,
+      actorName: req.user?.name || safeBody.username || 'anonymous',
+      actorRole: req.user?.role || 'guest',
+      action: deriveAction(req, res.statusCode),
+      entity,
+      entityId,
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      description: `${req.method} ${req.path} → ${res.statusCode}`,
+      ip: req.ip,
+      meta: safeBody,
+    });
+  });
+
+  next();
+});
+
 // ─── AUTH MIDDLEWARE ─────────────────────────────────────────────────────────
 
 function auth(req, res, next) {
@@ -154,10 +232,22 @@ function auth(req, res, next) {
 
 function requireRole(...roles) {
   return (req, res, next) => {
+    // The super admin can reach every endpoint.
+    if (req.user.role === SUPERADMIN) return next();
     if (!roles.includes(req.user.role))
       return res.status(403).json({ error: 'Access denied' });
     next();
   };
+}
+
+// Only a super admin may touch another super admin's account.
+async function protectSuperAdmin(req, res, next) {
+  try {
+    const target = await User.findOne({ id: req.params.id });
+    if (target && target.role === SUPERADMIN && req.user.role !== SUPERADMIN)
+      return res.status(403).json({ error: 'Only a super admin can modify a super admin account' });
+    next();
+  } catch (err) { res.status(500).json({ error: err.message }); }
 }
 
 // ─── LOGIN ───────────────────────────────────────────────────────────────────
@@ -199,7 +289,7 @@ app.post('/api/users', auth, requireRole(ADMIN), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.put('/api/users/:id', auth, requireRole(ADMIN), async (req, res) => {
+app.put('/api/users/:id', auth, requireRole(ADMIN), protectSuperAdmin, async (req, res) => {
   try {
     const update = { ...req.body };
     if (req.body.password) update.password = bcrypt.hashSync(req.body.password, 10);
@@ -209,11 +299,67 @@ app.put('/api/users/:id', auth, requireRole(ADMIN), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete('/api/users/:id', auth, requireRole(ADMIN), async (req, res) => {
+// Reset a user's password. If no password is supplied a temporary one is
+// generated and returned once so the super admin can hand it over.
+app.put('/api/users/:id/password', auth, requireRole(ADMIN), protectSuperAdmin, async (req, res) => {
+  try {
+    const target = await User.findOne({ id: req.params.id });
+    if (!target) return res.status(404).json({ error: 'Not found' });
+    const generated = !req.body.password;
+    const newPassword = req.body.password
+      || `Hms-${Math.random().toString(36).slice(-8)}${Math.floor(Math.random() * 90 + 10)}`;
+    target.password = bcrypt.hashSync(newPassword, 10);
+    await target.save();
+    res.json({ success: true, generated, password: generated ? newPassword : undefined });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/users/:id', auth, requireRole(ADMIN), protectSuperAdmin, async (req, res) => {
   try {
     if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot delete yourself' });
     await User.findOneAndDelete({ id: req.params.id });
     res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── AUDIT LOGS (super admin only) ───────────────────────────────────────────
+
+// Distinct values, for building the filter dropdowns on the client.
+app.get('/api/audit-logs/meta', auth, requireRole(SUPERADMIN), async (req, res) => {
+  try {
+    const [actions, entities, actors] = await Promise.all([
+      AuditLog.distinct('action'),
+      AuditLog.distinct('entity'),
+      AuditLog.aggregate([
+        { $group: { _id: '$actorId', name: { $last: '$actorName' }, role: { $last: '$actorRole' } } },
+        { $sort: { name: 1 } },
+      ]),
+    ]);
+    res.json({
+      actions: actions.filter(Boolean).sort(),
+      entities: entities.filter(Boolean).sort(),
+      actors: actors.map(a => ({ id: a._id, name: a.name, role: a.role })),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Full log with optional filters — action, actor, entity and a date range.
+// Any filter that is omitted (or "all") is not applied.
+app.get('/api/audit-logs', auth, requireRole(SUPERADMIN), async (req, res) => {
+  try {
+    const { action, actor, entity, from, to } = req.query;
+    const q = {};
+    if (action && action !== 'all') q.action = action;
+    if (entity && entity !== 'all') q.entity = entity;
+    if (actor && actor !== 'all') q.actorId = actor;
+    if (from || to) {
+      q.timestamp = {};
+      if (from) q.timestamp.$gte = new Date(from).toISOString();
+      if (to) { const d = new Date(to); d.setHours(23, 59, 59, 999); q.timestamp.$lte = d.toISOString(); }
+    }
+    const limit = Math.min(parseInt(req.query.limit, 10) || 1000, 5000);
+    const logs = await AuditLog.find(q).sort({ timestamp: -1 }).limit(limit);
+    res.json(logs);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -474,7 +620,7 @@ app.get('/api/stats', auth, async (req, res) => {
     const role = req.user.role;
     const stats = { role };
 
-    if (role === ADMIN) {
+    if (role === ADMIN || role === SUPERADMIN) {
       const [patients, doctors, staff, users, appointments, bills, transactions, inventory] = await Promise.all([
         Patient.countDocuments(),
         Doctor.countDocuments(),
@@ -499,6 +645,26 @@ app.get('/api/stats', auth, async (req, res) => {
         lowStockItems: inventory.filter(i => parseInt(i.quantity) < 10).length,
         recentPatients,
       });
+
+      if (role === SUPERADMIN) {
+        const allUsers = await User.find({}, { password: 0 });
+        const usersByRole = allUsers.reduce((acc, u) => { acc[u.role] = (acc[u.role] || 0) + 1; return acc; }, {});
+        const [auditTotal, auditToday, recentAudit] = await Promise.all([
+          AuditLog.countDocuments(),
+          AuditLog.countDocuments({ timestamp: { $gte: today } }),
+          AuditLog.find().sort({ timestamp: -1 }).limit(8),
+        ]);
+        Object.assign(stats, {
+          usersByRole,
+          activeUsers: allUsers.filter(u => u.status !== 'inactive').length,
+          disabledUsers: allUsers.filter(u => u.status === 'inactive').length,
+          auditTotal,
+          auditToday,
+          recentAudit,
+          totalAppointments: await Appointment.countDocuments(),
+          totalRecords: await MedicalRecord.countDocuments(),
+        });
+      }
 
     } else if (role === DOCTOR) {
       const doc = await Doctor.findOne({ linkedUserId: req.user.id });
@@ -564,11 +730,39 @@ async function seedAdmin() {
   }
 }
 
+// ─── SEED SUPER ADMIN ───────────────────────────────────────────────────────
+// Credentials come from the environment. Set SUPERADMIN_USERNAME and
+// SUPERADMIN_PASSWORD on the host (Render → Environment). The fallbacks below
+// are for local development only — change them before going live.
+async function seedSuperAdmin() {
+  const username = process.env.SUPERADMIN_USERNAME || 'superadmin';
+  const password = process.env.SUPERADMIN_PASSWORD || 'ChangeMe_SuperAdmin_2024';
+  const name = process.env.SUPERADMIN_NAME || 'Super Administrator';
+
+  const existing = await User.findOne({ username });
+  if (!existing) {
+    await new User({
+      id: uuidv4(),
+      name,
+      username,
+      password: bcrypt.hashSync(password, 10),
+      role: SUPERADMIN,
+      status: 'active',
+    }).save();
+    console.log(`✅ Super admin created — username: ${username}`);
+  } else if (existing.role !== SUPERADMIN) {
+    existing.role = SUPERADMIN;
+    await existing.save();
+    console.log(`✅ Existing user "${username}" promoted to super admin`);
+  }
+}
+
 // ─── START SERVER ─────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 4000;
 
 connect().then(async () => {
   await seedAdmin();
+  await seedSuperAdmin();
   app.listen(PORT, () => console.log(`🏥 HMS Backend running on http://localhost:${PORT}`));
 });
