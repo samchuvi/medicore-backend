@@ -20,3 +20,7 @@ npm-debug.log*
 
 # legacy JSON store — unused by the Mongoose server, contains PII + hashes
 data.json
+
+# local database backups (contain patient data)
+backups/
+*.bak
