@@ -1,0 +1,174 @@
+const B = process.env.API || 'http://localhost:4100/api';
+let pass = 0, fail = 0;
+const ok = (c, m) => { if (c) pass++; else { fail++; console.log('  ✗ FAIL:', m); } };
+const call = async (path, method = 'GET', body, token, headers = {}) => {
+  const r = await fetch(B + path, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}), ...headers }, body: body ? JSON.stringify(body) : undefined });
+  let j = null; try { j = await r.json(); } catch {}
+  return { s: r.status, j, h: r.headers };
+};
+const login = async (slug, u, p) => (await call('/login', 'POST', { hospitalSlug: slug, username: u, password: p }));
+const sfx = Date.now().toString(36);
+(async () => {
+  console.log('— login messages');
+  let r = await login('', 'superadmin', 'wrong'); ok(r.s === 401 && r.j.code === 'INVALID_CREDENTIALS', 'bad pw 401');
+  const m1 = r.j.error;
+  r = await login('nohospital' + sfx, 'x', 'y'); ok(r.s === 401 && r.j.error === m1, 'unknown hospital same msg (no enumeration)');
+  r = await call('/login', 'POST', { username: '', password: '' }); ok(r.s === 400 && r.j.code === 'MISSING_FIELDS', 'missing fields 400');
+  r = await call('/login', 'POST', { username: { $ne: 1 }, password: { $ne: 1 } }); ok(r.s === 400, 'object injection rejected');
+  const sa = await login('', 'superadmin', 'SuperAdminPass123'); ok(sa.s === 200, 'superadmin login'); const SA = sa.j.token;
+
+  console.log('— hospitals & currency');
+  const mk = async (slug, currency, country) => (await call('/hospitals', 'POST', { name: slug, slug, currency, country }, SA)).j;
+  const hUg = await mk('ug' + sfx, 'UGX', 'UG'), hCd = await mk('cd' + sfx, 'CDF', 'CD');
+  ok(hUg.currency === 'UGX' && hCd.currency === 'CDF', 'currency stored');
+  r = await call('/hospitals', 'POST', { name: 'x', slug: 'bad' + sfx, currency: 'XXX' }, SA); ok(r.s === 400, 'invalid currency rejected');
+  r = await call('/hospitals/' + hCd.id, 'PUT', { currency: 'USD' }, SA); ok(r.j.currency === 'USD', 'superadmin updates currency'); await call('/hospitals/' + hCd.id, 'PUT', { currency: 'CDF' }, SA);
+  for (const h of [hUg, hCd]) await call(`/hospitals/${h.id}/admin`, 'POST', { username: 'boss', password: 'Password123!', name: 'Boss' }, SA);
+  const aUg = await login(hUg.slug, 'boss', 'Password123!'), aCd = await login(hCd.slug, 'boss', 'Password123!');
+  ok(aUg.j.hospital.currency === 'UGX' && aCd.j.hospital.currency === 'CDF', 'login returns hospital currency');
+  const UG = aUg.j.token, CD = aCd.j.token;
+  r = await call('/hospital/settings', 'PUT', { currency: 'USD' }, UG); ok(r.s === 200 && r.j.currency === 'USD', 'hospital admin changes own currency'); await call('/hospital/settings', 'PUT', { currency: 'UGX' }, UG);
+  r = await call('/hospital/settings', 'PUT', { currency: 'ZZZ' }, UG); ok(r.s === 400, 'bad currency from admin rejected');
+  r = await call('/hospital/settings', 'PUT', { departments: ['Maternity', 'Surgery', 'Lab'] }, UG); ok(r.s === 200 && r.j.settings.departments.length === 3, 'custom departments');
+
+  console.log('— options & roles');
+  r = await call('/meta/options', 'GET', null, UG); ok(r.s === 200 && r.j.departments.includes('Maternity') && !r.j.assignableRoles.includes('admin') && !r.j.assignableRoles.includes('superadmin'), 'options: departments of hospital, no admin/superadmin assignable');
+  r = await call('/meta/options', 'GET', null, CD); ok(!r.j.departments.includes('Maternity') || r.j.departments.length > 3, 'other hospital has its own departments');
+  const mkUser = (tok, role, username) => call('/users', 'POST', { name: 'N ' + username, username, password: 'Password123!', role }, tok);
+  r = await mkUser(UG, 'superadmin', 'sa1'); ok(r.s === 403, 'admin cannot create superadmin');
+  r = await mkUser(UG, 'admin', 'ad1'); ok(r.s === 403, 'hospital admin cannot create admin');
+  r = await mkUser(UG, 'hacker', 'h1'); ok(r.s === 400 && r.j.code === 'INVALID_ROLE', 'invalid role rejected');
+  r = await mkUser(UG, '', 'h2'); ok(r.s === 400, 'missing role rejected');
+  r = await call('/users', 'POST', { name: 'S', username: 'short', password: '123', role: 'doctor' }, UG); ok(r.s === 400, 'short password rejected');
+  r = await mkUser(UG, 'labstaff', 'lab1'); ok(r.s === 200 && !r.j.password, 'create labstaff');
+  r = await mkUser(UG, 'labstaff', 'lab1'); ok(r.s === 409, 'duplicate username 409');
+  const doctorUser = (await mkUser(UG, 'doctor', 'doc1')).j; const rec = (await mkUser(UG, 'receptionist', 'rec1')).j; await mkUser(UG, 'pharmacist', 'pha1');
+  r = await call('/users/' + doctorUser.id, 'PUT', { role: 'admin' }, UG); ok(r.s === 403, 'cannot promote to admin');
+  r = await call('/users/' + doctorUser.id, 'PUT', { role: 'superadmin' }, UG); ok(r.s === 403, 'cannot promote to superadmin');
+  const dl = await login(hUg.slug, 'doc1', 'Password123!'), rl = await login(hUg.slug, 'rec1', 'Password123!'), ll = await login(hUg.slug, 'lab1', 'Password123!'), pl = await login(hUg.slug, 'pha1', 'Password123!');
+  const DOC = dl.j.token, REC = rl.j.token, LAB = ll.j.token, PHA = pl.j.token;
+
+  console.log('— staff & doctors validation');
+  r = await call('/staff', 'POST', { name: 'Nurse A', role: 'Nurse', department: 'Maternity' }, UG); ok(r.s === 200, 'staff valid');
+  r = await call('/staff', 'POST', { name: 'X', role: 'Super Boss' }, UG); ok(r.s === 400, 'staff invalid role');
+  r = await call('/staff', 'POST', { name: 'X', role: 'Nurse', department: 'Not A Dept' }, UG); ok(r.s === 400, 'staff invalid dept');
+  r = await call('/staff', 'POST', { name: 'X', role: 'Nurse', department: 'Maternity' }, DOC); ok(r.s === 403, 'doctor cannot create staff');
+  r = await call('/doctors', 'POST', { name: 'Dr A', qualification: 'MBChB', department: 'Surgery', linkedUserId: doctorUser.id }, UG); ok(r.s === 200, 'doctor valid'); const docRec = r.j;
+  r = await call('/doctors', 'POST', { name: 'Dr B', qualification: 'Wizard' }, UG); ok(r.s === 400, 'doctor invalid qualification');
+  const cdUser = (await call('/users', 'POST', { name: 'D', username: 'cddoc', password: 'Password123!', role: 'doctor' }, CD)).j;
+  r = await call('/doctors', 'POST', { name: 'Dr C', linkedUserId: cdUser.id }, UG); ok(r.s === 400, 'cannot link another hospital\'s user');
+  r = await call('/staff', 'GET', null, REC); ok(r.s === 403, 'receptionist cannot list staff');
+
+  console.log('— patients, numbers, search');
+  const P = async (tok, name, phone) => (await call('/patients', 'POST', { name, phone, age: 30, gender: 'Female' }, tok)).j;
+  const [p1, p2, p3] = await Promise.all([P(REC, 'Alice Nakato', '0700111222'), P(REC, 'Bob Mugisha', '0700333444'), P(REC, 'Carol Alice', '0700555666')]);
+  ok(p1.patientNumber && p2.patientNumber && new Set([p1.patientNumber, p2.patientNumber, p3.patientNumber]).size === 3, 'unique patient numbers under concurrency: ' + [p1.patientNumber, p2.patientNumber, p3.patientNumber]);
+  const pc = await P(CD, 'Congo Patient', '0999'); ok(pc.patientNumber === 'P-000001', 'numbers are per hospital');
+  r = await call('/patients?q=alice&limit=20', 'GET', null, REC); ok(r.j.length === 2, 'search by name');
+  r = await call('/patients?q=' + p2.patientNumber, 'GET', null, REC); ok(r.j.length === 1 && r.j[0].id === p2.id, 'search by number');
+  r = await call('/patients?q=0700333', 'GET', null, REC); ok(r.j.length === 1, 'search by phone');
+  r = await call('/patients?q=Congo', 'GET', null, REC); ok(r.j.length === 0, 'search is tenant isolated');
+  r = await call('/patients', 'POST', { name: '  ' }, REC); ok(r.s === 400, 'empty patient name rejected');
+  r = await call('/patients', 'POST', { name: 'Z', patientNumber: 'P-999999' }, REC); ok(r.j.patientNumber !== 'P-999999', 'client cannot set patient number');
+  r = await call('/patients', 'GET', null, LAB); ok(r.s === 403, 'labstaff has no patient list');
+
+  console.log('— appointments');
+  const ap = { patientId: p1.id, doctorId: docRec.id, date: '2030-01-01', time: '10:00', reason: 'Checkup' };
+  r = await call('/appointments', 'POST', ap, REC); ok(r.s === 200 && r.j.patientName === 'Alice Nakato' && r.j.patientId === p1.id, 'booked with real patient id, name from DB');
+  r = await call('/appointments', 'POST', ap, REC); ok(r.s === 409, 'duplicate slot refused');
+  r = await call('/appointments', 'POST', { ...ap, patientId: pc.id, time: '11:00' }, REC); ok(r.s === 400, 'cross-tenant patient refused');
+  r = await call('/appointments', 'POST', { ...ap, patientId: 'nonsense', time: '12:00' }, REC); ok(r.s === 400, 'unknown patient refused');
+  r = await call('/appointments', 'POST', { ...ap, patientName: 'Fake', patientId: p2.id, time: '13:00' }, REC); ok(r.j.patientName === 'Bob Mugisha', 'forged name ignored');
+  r = await call('/appointments', 'POST', { ...ap, time: '14:00' }, PHA); ok(r.s === 403, 'pharmacist cannot book');
+
+  console.log('— idempotency');
+  const key = 'k-' + sfx; const body = { name: 'Dup Test', phone: '1' };
+  const rs = await Promise.all([1, 2, 3].map(() => call('/patients', 'POST', body, REC, { 'Idempotency-Key': key })));
+  ok(rs.filter(x => x.s === 200).length >= 1 && rs.every(x => [200, 409].includes(x.s)), 'parallel same key: ' + rs.map(x => x.s));
+  const again = await call('/patients', 'POST', body, REC, { 'Idempotency-Key': key }); ok(again.s === 200 && again.h.get('idempotent-replay') === 'true', 'replay returns first answer');
+  r = await call('/patients?q=Dup Test', 'GET', null, REC); ok(r.j.length === 1, 'only one patient created from 4 identical submits');
+
+  console.log('— lab workflow');
+  r = await call('/lab-orders', 'POST', { patientId: p1.id, priority: 'urgent', tests: [{ name: 'Malaria RDT', price: 5000 }] }, DOC); ok(r.s === 200, 'doctor orders lab: ' + JSON.stringify(r.j).slice(0, 100)); const lo = r.j;
+  r = await call('/lab-orders', 'GET', null, LAB); ok(r.s === 200 && r.j.some(o => o.id === lo.id), 'lab tech sees order');
+  r = await call('/lab-orders/' + lo.id, 'PUT', { status: 'in_progress', tests: [{ result: '', unit: '', referenceRange: '', flag: '' }] }, LAB); ok(r.s === 200, 'lab starts');
+  r = await call('/lab-orders/' + lo.id, 'PUT', { status: 'completed', tests: [{ result: 'Positive', unit: '', referenceRange: 'Negative', flag: 'abnormal' }] }, LAB); ok(r.s === 200 && r.j.status === 'completed', 'lab completes');
+  r = await call('/lab-orders/' + lo.id, 'PUT', { tests: [{ result: 'Negative' }] }, LAB); ok([400,403,409].includes(r.s), 'released result locked for lab tech: ' + r.s);
+  r = await call('/lab-orders', 'POST', { patientId: p1.id, tests: [{ name: 'x' }] }, LAB); ok(r.s === 403, 'lab tech cannot order');
+  r = await call('/lab-orders', 'GET', null, CD); ok(r.s === 200 && !r.j.some(o => o.id === lo.id), 'other hospital cannot see lab orders');
+  r = await call('/lab-orders/' + lo.id, 'PUT', { notes: 'x' }, CD); ok(r.s === 404 || r.s === 403, 'cross-tenant lab edit blocked');
+  r = await call('/lab-orders', 'GET', null, REC); ok(r.s === 403, 'receptionist cannot see lab');
+  r = await call('/bills', 'GET', null, LAB); ok(r.s === 403, 'lab tech cannot see bills');
+  r = await call('/users', 'GET', null, LAB); ok(r.s === 403, 'lab tech cannot list users');
+
+
+  console.log('— billing & payments');
+  r = await call('/bills', 'POST', { patientId: p1.id, items: [], totalAmount: 0 }, REC); ok(r.s === 400, 'empty bill rejected');
+  r = await call('/bills', 'POST', { patientId: pc.id, items: [{ desc: 'x', amount: 10 }], totalAmount: 10 }, REC); ok(r.s === 400, 'bill for other hospital patient refused');
+  r = await call('/bills', 'POST', { patientId: p1.id, items: [{ desc: 'Consult', amount: 20000 }], totalAmount: 20000, paidAmount: 20000, status: 'paid' }, REC); ok(r.s === 200 && r.j.status === 'pending' && r.j.paidAmount === 0 && r.j.patientName === 'Alice Nakato', 'bill: client cannot pre-mark paid');
+  const bill = r.j;
+  r = await call('/bills', 'GET', null, REC); ok(r.s === 200 && r.j.find(b => b.id === bill.id).patientName === 'Alice Nakato', 'bills list has patient name');
+  r = await call('/transactions', 'POST', { billId: bill.id, amount: 0, method: 'Cash' }, REC); ok(r.s === 400, 'zero payment rejected');
+  r = await call('/transactions', 'POST', { billId: bill.id, amount: 99999999, method: 'Cash' }, REC); ok(r.s === 400, 'overpayment rejected');
+  r = await call('/transactions', 'POST', { billId: bill.id, amount: 5000, method: 'Cash' }, REC); ok(r.s === 200 && r.j.txRef, 'partial payment ok');
+  r = await call('/bills', 'GET', null, REC); ok(r.j.find(b => b.id === bill.id).status === 'partial' && r.j.find(b => b.id === bill.id).remainingAmount === 15000, 'bill partial 15000 left');
+  const pay = await Promise.all([1, 2].map(() => call('/transactions', 'POST', { billId: bill.id, amount: 15000, method: 'Cash' }, REC, { 'Idempotency-Key': 'pay-' + sfx })));
+  ok(pay.filter(x => x.s === 200).length >= 1, 'final payment ok');
+  r = await call('/transactions', 'POST', { billId: bill.id, amount: 15000, method: 'Cash' }, REC); ok(r.s === 409, 'paying an already-paid bill refused');
+  r = await call('/transactions', 'GET', null, REC); ok(r.j.filter(x => x.billId === bill.id).length === 2, 'exactly 2 payments recorded (no double charge): ' + r.j.filter(x => x.billId === bill.id).length);
+  r = await call('/transactions', 'POST', { billId: bill.id, amount: 1, method: 'Cash' }, CD); ok(r.s === 400, 'cross-tenant bill payment refused');
+  r = await call('/records', 'POST', { patientId: p1.id, doctorId: docRec.id, diagnosis: 'Malaria' }, DOC); ok(r.s === 200 && r.j.patientName === 'Alice Nakato', 'record saved with names');
+  r = await call('/records', 'POST', { patientId: pc.id, diagnosis: 'x' }, DOC); ok(r.s === 400, 'record for foreign patient refused');
+
+  console.log('— mixed-currency payments (USD main + CDF)');
+  const hMix = await mk('mx' + sfx, 'USD', 'CD'); await call(`/hospitals/${hMix.id}/admin`, 'POST', { username: 'boss', password: 'Password123!' }, SA);
+  const MX = (await login(hMix.slug, 'boss', 'Password123!')).j.token;
+  r = await call('/hospital/settings', 'PUT', { acceptedCurrencies: ['CDF'] }, MX); ok(r.s === 400, 'extra currency without a rate rejected');
+  r = await call('/hospital/settings', 'PUT', { acceptedCurrencies: ['CDF'], exchangeRates: { CDF: -5 } }, MX); ok(r.s === 400, 'negative rate rejected');
+  r = await call('/hospital/settings', 'PUT', { acceptedCurrencies: ['XXX'], exchangeRates: { XXX: 2 } }, MX); ok(r.s === 400, 'unknown currency rejected');
+  r = await call('/hospital/settings', 'PUT', { acceptedCurrencies: ['CDF'], exchangeRates: { CDF: 2800 } }, MX); ok(r.s === 200 && r.j.settings.acceptedCurrencies.join() === 'USD,CDF' && r.j.settings.exchangeRates.CDF === 2800, 'accept CDF at 2800');
+  r = await call('/session', 'GET', null, MX); ok(r.j.hospital.settings.exchangeRates.CDF === 2800, 'session exposes rates');
+  const mp = (await call('/patients', 'POST', { name: 'Mix Patient' }, MX)).j;
+  const mb = (await call('/bills', 'POST', { patientId: mp.id, items: [{ desc: 'x', amount: 100 }], totalAmount: 100 }, MX)).j;
+  r = await call('/transactions', 'POST', { billId: mb.id, amount: 140000, currency: 'CDF', method: 'Cash' }, MX); ok(r.s === 200 && r.j.amount === 50 && r.j.tenderedCurrency === 'CDF' && r.j.tenderedAmount === 140000 && r.j.exchangeRate === 2800, '140,000 CDF = 50 USD recorded with rate');
+  r = await call('/transactions', 'POST', { billId: mb.id, amount: 20, currency: 'USD', method: 'Cash' }, MX); ok(r.s === 200 && r.j.amount === 20 && r.j.tenderedCurrency === 'USD', 'USD part payment');
+  r = await call('/transactions', 'POST', { billId: mb.id, amount: 100, currency: 'EUR', method: 'Cash' }, MX); ok(r.s === 400, 'currency not accepted refused');
+  r = await call('/transactions', 'POST', { billId: mb.id, amount: 90000, currency: 'CDF', method: 'Cash' }, MX); ok(r.s === 400, 'CDF payment above remaining refused (32.14 > 30)');
+  r = await call('/transactions', 'POST', { billId: mb.id, amount: 84000, currency: 'CDF', method: 'Cash' }, MX); ok(r.s === 200 && r.j.amount === 30, 'remaining 30 USD settled with 84,000 CDF');
+  r = await call('/bills', 'GET', null, MX); const mbb = r.j.find(b => b.id === mb.id); ok(mbb.status === 'paid' && mbb.remainingAmount === 0 && mbb.paidAmount === 100, 'bill paid, totals in USD');
+  r = await call('/stats', 'GET', null, MX); ok(r.j.totalRevenue === 100, 'revenue is 100 USD, not mixed units');
+  r = await call('/hospital/settings', 'PUT', { currency: 'CDF' }, MX); ok(r.s === 200 && r.j.settings.acceptedCurrencies.join() === 'CDF', 'changing main currency clears extra currencies');
+
+  console.log('— RBAC & tenant isolation');
+  r = await call('/patients/' + p1.id, 'PUT', { name: 'Hacked' }, CD); ok(r.s === 404, 'cannot edit other hospital patient');
+  r = await call('/patients/' + p1.id + '/history', 'GET', null, CD); ok(r.s === 404, 'cannot read other hospital history');
+  r = await call('/patients/' + p1.id, 'DELETE', null, DOC); ok(r.s === 403, 'doctor cannot delete patient');
+  r = await call('/hospitals', 'GET', null, UG); ok(r.s === 403, 'admin cannot list hospitals');
+  r = await call('/audit-logs', 'GET', null, UG); ok(r.s === 403, 'admin cannot read audit logs');
+  r = await call('/users/' + sa.j.user.id + '/password', 'PUT', { password: 'Password123!x' }, UG); ok(r.s === 404 || r.s === 403, 'admin cannot reset superadmin password');
+  r = await call('/patients', 'GET'); ok(r.s === 401, 'no token 401');
+  r = await call('/patients', 'GET', null, 'garbage'); ok(r.s === 401 && r.j.code === 'SESSION_EXPIRED', 'bad token 401 code');
+
+  console.log('— immediate disable & role change');
+  r = await call('/users/' + rec.id, 'PUT', { status: 'inactive' }, UG); ok(r.s === 200, 'disable receptionist');
+  r = await call('/patients', 'GET', null, REC); ok(r.s === 401, 'disabled user token rejected immediately');
+  r = await login(hUg.slug, 'rec1', 'Password123!'); ok(r.s === 401, 'disabled user cannot login');
+  await call('/users/' + rec.id, 'PUT', { status: 'active' }, UG);
+
+  console.log('— suspended hospital');
+  await call(`/hospitals/${hCd.id}/suspend`, 'POST', null, SA);
+  r = await call('/patients', 'GET', null, CD); ok(r.s === 403, 'suspended hospital locked out');
+  r = await login(hCd.slug, 'boss', 'Password123!'); ok(r.s === 401 && r.j.error === m1, 'suspended login same generic msg');
+  await call(`/hospitals/${hCd.id}/resume`, 'POST', null, SA);
+
+  console.log('— stats / superadmin currency');
+  r = await call('/stats', 'GET', null, SA); ok(r.s === 200 && r.j.revenueByCurrency && typeof r.j.revenueByCurrency === 'object', 'superadmin revenueByCurrency');
+  r = await call('/hospitals/overview', 'GET', null, SA); ok(r.j.find(h => h.id === hCd.id).currency === 'CDF', 'overview has currency');
+
+  console.log('— audit redaction & errors');
+  await call('/users/' + doctorUser.id + '/password', 'PUT', { password: 'Secret-Value-1!' }, UG);
+  r = await call('/audit-logs?limit=50', 'GET', null, SA); const txt = JSON.stringify(r.j); ok(!txt.includes('Secret-Value-1!') && !txt.includes('Password123!'), 'no passwords in audit trail');
+  r = await call('/patients/' + 'x'.repeat(10), 'PUT', { age: { $bad: 1 } }, REC); ok(r.s < 500 || !/stack|at .*\(/.test(JSON.stringify(r.j)), 'no stack in errors');
+  console.log(`\n${pass} passed, ${fail} failed`);
+  process.exit(fail ? 1 : 0);
+})().catch(e => { console.error(e); process.exit(2); });

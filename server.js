@@ -24,6 +24,31 @@ const RECEPTIONIST = 'receptionist';
 const PHARMACIST = 'pharmacist';
 const LAB_STAFF = 'labstaff';
 
+// Never leak internals (stack traces, driver messages) to the browser: log the
+// detail server-side, return a short safe message with a machine-readable code.
+function serverError(res, err) {
+  console.error('❌', err && err.stack ? err.stack : err);
+  if (res.headersSent) return;
+  res.status(500).json({ error: 'Something went wrong on the server. Please try again in a moment.', code: 'SERVER_ERROR' });
+}
+
+// Currencies a hospital can choose (shown everywhere money appears).
+const CURRENCIES = {
+  UGX: { symbol: 'UGX', name: 'Ugandan Shilling', decimals: 0 },
+  CDF: { symbol: 'FC', name: 'Congolese Franc', decimals: 0 },
+  USD: { symbol: '$', name: 'US Dollar', decimals: 2 },
+  KES: { symbol: 'KSh', name: 'Kenyan Shilling', decimals: 0 },
+  TZS: { symbol: 'TSh', name: 'Tanzanian Shilling', decimals: 0 },
+  RWF: { symbol: 'FRw', name: 'Rwandan Franc', decimals: 0 },
+  BIF: { symbol: 'FBu', name: 'Burundian Franc', decimals: 0 },
+  EUR: { symbol: '€', name: 'Euro', decimals: 2 },
+};
+const COUNTRIES = ['UG', 'CD', 'KE', 'TZ', 'RW', 'BI', 'SS', 'OTHER'];
+const DEFAULT_DEPARTMENTS = ['General Medicine', 'Outpatient (OPD)', 'Maternity', 'Paediatrics', 'Surgery', 'Laboratory', 'Pharmacy', 'Radiology', 'Dental', 'Emergency', 'Administration'];
+// Job titles for the staff register (the login role is separate: see ASSIGNABLE_ROLES).
+const STAFF_ROLES = ['Nurse', 'Midwife', 'Clinical Officer', 'Lab Technician', 'Pharmacist', 'Pharmacy Assistant', 'Receptionist', 'Accountant', 'Cashier', 'Cleaner', 'Security', 'Driver', 'Records Officer', 'Administrator', 'Other'];
+const QUALIFICATIONS = ['MBChB', 'MD', 'MBBS', 'MMed', 'MSc', 'PhD', 'Diploma in Clinical Medicine', 'Certificate in Clinical Medicine', 'BSc Nursing', 'Diploma in Nursing', 'Diploma in Midwifery', 'Diploma in Medical Laboratory Technology', 'BSc Pharmacy', 'Diploma in Pharmacy', 'Specialist (Fellowship)', 'Other'];
+
 // ─── CORS ────────────────────────────────────────────────────────────────────
 const rawOrigins = process.env.CORS_ORIGINS;
 if (rawOrigins) {
@@ -56,17 +81,25 @@ setInterval(() => {
   for (const [key, hit] of loginHits) if (hit.first < cutoff) loginHits.delete(key);
 }, LOGIN_WINDOW_MS).unref();
 
-function loginRateLimit(req, res, next) {
-  const key = req.ip || 'unknown';
-  const now = Date.now();
+// Two counters: per network address AND per account (hospital + username). The
+// per-account one still protects an account if someone fakes their address header.
+const ACCOUNT_MAX_ATTEMPTS = 20;
+function hitLimiter(key, max, now) {
   const hit = loginHits.get(key);
-  if (!hit || now - hit.first > LOGIN_WINDOW_MS) {
-    loginHits.set(key, { count: 1, first: now });
-    return next();
-  }
+  if (!hit || now - hit.first > LOGIN_WINDOW_MS) { loginHits.set(key, { count: 1, first: now }); return null; }
   hit.count += 1;
-  if (hit.count > LOGIN_MAX_ATTEMPTS)
-    return res.status(429).json({ error: 'Too many login attempts. Please wait a few minutes and try again.' });
+  return hit.count > max ? Math.max(1, Math.ceil((hit.first + LOGIN_WINDOW_MS - now) / 1000)) : null;
+}
+function loginRateLimit(req, res, next) {
+  const now = Date.now();
+  const b = req.body || {};
+  req.loginKeys = [`ip:${req.ip || 'unknown'}`, `acct:${String(b.hospitalSlug || '').toLowerCase().trim()}|${String(b.username || '').toLowerCase().trim()}`];
+  const waits = [hitLimiter(req.loginKeys[0], LOGIN_MAX_ATTEMPTS, now), hitLimiter(req.loginKeys[1], ACCOUNT_MAX_ATTEMPTS, now)].filter(Boolean);
+  if (waits.length) {
+    const wait = Math.max(...waits);
+    res.set('Retry-After', String(wait));
+    return res.status(429).json({ error: `Too many login attempts. Please wait ${Math.ceil(wait / 60)} minute(s) and try again.`, code: 'RATE_LIMITED', retryAfter: wait });
+  }
   next();
 }
 
@@ -85,7 +118,7 @@ const HospitalSchema = new mongoose.Schema({
   },
   features: {
     pharmacy: { type: Boolean, default: true },
-    laboratory: { type: Boolean, default: false },
+    laboratory: { type: Boolean, default: true },
     billing: { type: Boolean, default: true },
     insurance: { type: Boolean, default: false },
     theatre: { type: Boolean, default: false },
@@ -100,14 +133,44 @@ const HospitalSchema = new mongoose.Schema({
     //   optional – walk-in customers allowed; a registered patient can be picked
     //   required – every sale must be linked to a registered patient
     pharmacyPatientLink: { type: String, enum: ['off', 'optional', 'required'], default: 'optional' },
+    // Departments this hospital offers (staff and doctors pick from these).
+    departments: { type: [String], default: undefined },
+    // Extra currencies this hospital accepts for payments (the hospital's own `currency` is always accepted).
+    // exchangeRates[code] = how many units of that currency equal ONE unit of the hospital's main currency
+    // (e.g. main USD, exchangeRates.CDF = 2800 means 1 USD = 2,800 CDF).
+    acceptedCurrencies: { type: [String], default: undefined },
+    exchangeRates: { type: mongoose.Schema.Types.Mixed },
   },
+  currency: { type: String, default: 'UGX' }, // ISO code from CURRENCIES
+  country: { type: String, default: 'UG' },
   status: { type: String, default: 'active' }, // active | suspended | trial
   createdAt: { type: String, default: () => new Date().toISOString() },
 });
 const Hospital = mongoose.model('Hospital', HospitalSchema);
 // Hospitals created before settings existed simply get the defaults.
 const PHARMACY_LINK_MODES = ['off', 'optional', 'required'];
-const hospitalSettings = (h) => ({ pharmacyPatientLink: h?.settings?.pharmacyPatientLink || 'optional' });
+const hospitalSettings = (h) => {
+  const base = CURRENCIES[h?.currency] ? h.currency : 'UGX';
+  const stored = h?.settings?.exchangeRates || {};
+  const exchangeRates = {};
+  for (const c of h?.settings?.acceptedCurrencies || []) {
+    const r = Number(stored[c]);
+    if (c !== base && CURRENCIES[c] && r > 0) exchangeRates[c] = r; // only usable with a valid rate
+  }
+  return {
+    pharmacyPatientLink: h?.settings?.pharmacyPatientLink || 'optional',
+    departments: h?.settings?.departments && h.settings.departments.length ? h.settings.departments : DEFAULT_DEPARTMENTS,
+    acceptedCurrencies: [base, ...Object.keys(exchangeRates)],
+    exchangeRates,
+  };
+};
+// What the browser needs to format money for this hospital.
+const hospitalPublic = (h) => ({
+  id: h.id, name: h.name, logo: h.logo, theme: h.theme, features: h.features,
+  settings: hospitalSettings(h),
+  currency: CURRENCIES[h.currency] ? h.currency : 'UGX',
+  country: h.country || 'UG',
+});
 
 // The platform owner's own settings (one document): the system name, colour and
 // logo shown on the login page and in the platform owner's screens.
@@ -141,6 +204,7 @@ const User = mongoose.model('User', UserSchema);
 const PatientSchema = new mongoose.Schema({
   id: { type: String, default: () => uuidv4() },
   hospitalId: { type: String },
+  patientNumber: String, // human-friendly MRN, unique per hospital, e.g. P-000123
   name: String,
   age: Number,
   gender: String,
@@ -152,7 +216,41 @@ const PatientSchema = new mongoose.Schema({
   notes: String,
   createdAt: { type: String, default: () => new Date().toISOString() },
 });
+PatientSchema.index({ hospitalId: 1, patientNumber: 1 });
+PatientSchema.index({ hospitalId: 1, name: 1 });
 const Patient = mongoose.model('Patient', PatientSchema);
+
+// Atomic per-hospital counters (patient numbers) — two simultaneous registrations can never get the same number.
+const CounterSchema = new mongoose.Schema({ key: { type: String, unique: true }, seq: { type: Number, default: 0 } });
+const Counter = mongoose.model('Counter', CounterSchema);
+async function nextSeq(key) {
+  for (let attempt = 0; ; attempt++) {
+    try { return (await Counter.findOneAndUpdate({ key }, { $inc: { seq: 1 } }, { new: true, upsert: true })).seq; }
+    catch (e) { if (e && e.code === 11000 && attempt < 5) continue; throw e; }
+  }
+}
+async function nextPatientNumber(hospitalId) {
+  // The very first concurrent upserts can race on the unique key; retry resolves it.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const c = await Counter.findOneAndUpdate({ key: `patient:${hospitalId}` }, { $inc: { seq: 1 } }, { new: true, upsert: true });
+      return `P-${String(c.seq).padStart(6, '0')}`;
+    } catch (e) {
+      if (e && e.code === 11000 && attempt < 5) continue;
+      throw e;
+    }
+  }
+}
+// Give existing patients a number (oldest first). Safe to run on every start.
+async function backfillPatientNumbers() {
+  const missing = await Patient.find({ $or: [{ patientNumber: { $exists: false } }, { patientNumber: null }, { patientNumber: '' }] }).sort({ createdAt: 1 });
+  for (const p of missing) {
+    if (!p.hospitalId) continue;
+    p.patientNumber = await nextPatientNumber(p.hospitalId);
+    await p.save();
+  }
+  if (missing.length) console.log(`✅ Patient numbers assigned to ${missing.length} existing patient(s)`);
+}
 
 const DoctorSchema = new mongoose.Schema({
   id: { type: String, default: () => uuidv4() },
@@ -386,7 +484,10 @@ const TransactionSchema = new mongoose.Schema({
   billId: String,
   patientId: String,
   patientName: String,
-  amount: { type: Number, default: 0 },
+  amount: { type: Number, default: 0 },       // always in the hospital's MAIN currency (so totals stay correct)
+  tenderedCurrency: String,                    // what the patient actually paid in (e.g. CDF)
+  tenderedAmount: Number,                      // …and how much of it
+  exchangeRate: Number,                        // units of tenderedCurrency per 1 main-currency unit, fixed at payment time
   recordedBy: String,
   method: String,
   note: String,
@@ -474,6 +575,35 @@ function requireFeature(featureKey) {
   };
 }
 
+// ─── DUPLICATE-SUBMISSION GUARD ──────────────────────────────────────────────
+// The browser sends one Idempotency-Key per user action. If the same key arrives
+// again (double click, impatient retry, flaky network resend) we never run the
+// action twice: a finished request replays its first answer, a running one is refused.
+const crypto = require('crypto');
+const idem = new Map(); // hash -> { state: 'running'|'done', status, body, at }
+setInterval(() => { const cut = Date.now() - 10 * 60 * 1000; for (const [k, v] of idem) if (v.at < cut) idem.delete(k); }, 60 * 1000).unref();
+app.use((req, res, next) => {
+  const key = req.method === 'POST' && req.headers['idempotency-key'];
+  if (!key || typeof key !== 'string' || key.length > 100) return next();
+  const h = crypto.createHash('sha256').update(`${req.headers.authorization || req.ip}|${req.path}|${key}`).digest('hex');
+  const prev = idem.get(h);
+  if (prev) {
+    if (prev.state === 'running') return res.status(409).json({ error: 'This request is already being processed.', code: 'DUPLICATE_REQUEST' });
+    res.set('Idempotent-Replay', 'true');
+    return res.status(prev.status).json(prev.body);
+  }
+  idem.set(h, { state: 'running', at: Date.now() });
+  const orig = res.json.bind(res);
+  res.json = (body) => {
+    // Failed attempts may be retried with the same key; only successes are replayed.
+    if (res.statusCode < 400) idem.set(h, { state: 'done', status: res.statusCode, body, at: Date.now() });
+    else idem.delete(h);
+    return orig(body);
+  };
+  res.on('close', () => { const cur = idem.get(h); if (cur && cur.state === 'running') idem.delete(h); });
+  next();
+});
+
 // ─── AUDIT TRAIL ─────────────────────────────────────────────────────────────
 const AUDITED_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -496,8 +626,13 @@ function deriveAction(req, statusCode) {
 app.use((req, res, next) => {
   if (!AUDITED_METHODS.has(req.method) || !req.path.startsWith('/api/')) return next();
 
+  // Never write secrets or bulky blobs into the audit trail.
   const safeBody = req.body && typeof req.body === 'object' ? { ...req.body } : {};
-  if ('password' in safeBody) safeBody.password = '***';
+  for (const k of Object.keys(safeBody)) {
+    if (/pass(word|phrase)?|token|secret/i.test(k)) safeBody[k] = '***';
+    else if (k === 'logo') safeBody[k] = '[image]';
+    else if (typeof safeBody[k] === 'string' && safeBody[k].length > 500) safeBody[k] = safeBody[k].slice(0, 500) + '…';
+  }
 
   const originalJson = res.json.bind(res);
   res.json = (data) => { res.locals.responseBody = data; return originalJson(data); };
@@ -533,7 +668,17 @@ async function auth(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
   try { req.user = jwt.verify(token, SECRET); }
-  catch { return res.status(401).json({ error: 'Invalid token' }); }
+  catch { return res.status(401).json({ error: 'Your session has expired. Please sign in again.', code: 'SESSION_EXPIRED' }); }
+
+  // The account must still exist and be active, and its CURRENT role (not the
+  // one baked into the token) is what counts — so disabling a user or changing
+  // their role takes effect immediately.
+  try {
+    const live = await User.findOne({ id: req.user.id }, { role: 1, status: 1, hospitalId: 1, name: 1 });
+    if (!live || live.status === 'inactive' || (live.hospitalId || undefined) !== (req.user.hospitalId || undefined))
+      return res.status(401).json({ error: 'Your session has expired. Please sign in again.', code: 'SESSION_EXPIRED' });
+    req.user.role = live.role; req.user.name = live.name;
+  } catch (err) { return serverError(res, err); }
 
   // A hospital that gets suspended (e.g. for non-payment) is locked out of
   // every route immediately — including staff who are already logged in with
@@ -542,9 +687,9 @@ async function auth(req, res, next) {
     try {
       const hospital = await Hospital.findOne({ id: req.user.hospitalId });
       if (!hospital || hospital.status !== 'active') {
-        return res.status(403).json({ error: 'This hospital\'s access has been suspended. Please contact your platform administrator.' });
+        return res.status(403).json({ error: 'This hospital\'s access has been suspended. Please contact your platform administrator.', code: 'SUSPENDED' });
       }
-    } catch (err) { return res.status(500).json({ error: err.message }); }
+    } catch (err) { return serverError(res, err); }
   }
   next();
 }
@@ -554,7 +699,7 @@ function requireRole(...roles) {
     // The super admin can reach every endpoint.
     if (req.user.role === SUPERADMIN) return next();
     if (!roles.includes(req.user.role))
-      return res.status(403).json({ error: 'Access denied' });
+      return res.status(403).json({ error: 'You do not have permission to do this.', code: 'FORBIDDEN' });
     next();
   };
 }
@@ -566,13 +711,13 @@ async function protectSuperAdmin(req, res, next) {
     if (target && target.role === SUPERADMIN && req.user.role !== SUPERADMIN)
       return res.status(403).json({ error: 'Only a super admin can modify a super admin account' });
     next();
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 }
 
 // Guard the `role` field on user create / update so an ordinary admin cannot
 // mint (or promote themselves to) a super admin, and cannot set a bogus role.
 const ASSIGNABLE_ROLES = new Set([ADMIN, DOCTOR, RECEPTIONIST, PHARMACIST, LAB_STAFF]);
-function sanitizeUserRole(req, res, next) {
+async function sanitizeUserRole(req, res, next) {
   const { role } = req.body;
   if (role === undefined || role === null || role === '') return next();
   if (role === SUPERADMIN) {
@@ -581,7 +726,18 @@ function sanitizeUserRole(req, res, next) {
     return next();
   }
   if (!ASSIGNABLE_ROLES.has(role))
-    return res.status(400).json({ error: `Invalid role: ${role}` });
+    return res.status(400).json({ error: 'Please choose a valid role.', code: 'INVALID_ROLE' });
+  // Administrator rights are powerful: only the platform owner hands them out.
+  if (role === ADMIN && req.user.role !== SUPERADMIN) {
+    // Editing an account that is ALREADY an administrator (name, status…) is fine; creating or promoting is not.
+    let alreadyAdmin = false;
+    if (req.method !== 'POST' && req.params.id) {
+      try { const t = await User.findOne({ id: req.params.id, ...scope(req) }, { role: 1 }); alreadyAdmin = !!t && t.role === ADMIN; }
+      catch (e) { return serverError(res, e); }
+    }
+    if (!alreadyAdmin)
+      return res.status(403).json({ error: 'Only the platform owner can create or promote an administrator.', code: 'FORBIDDEN' });
+  }
   next();
 }
 
@@ -591,34 +747,39 @@ function sanitizeUserRole(req, res, next) {
 // in with no hospitalSlug at all. Same error either way credentials fail, so
 // a bad guess never reveals whether a given hospital slug exists.
 
+// One message for every credential failure, so the response never reveals whether
+// the hospital code, the username or the password was the wrong part.
+const BAD_LOGIN = 'Incorrect hospital code, username or password. Please check and try again.';
 app.post('/api/login', loginRateLimit, async (req, res) => {
   try {
-    const { hospitalSlug, username, password } = req.body;
+    const { hospitalSlug, username, password } = req.body || {};
+    if (typeof username !== 'string' || typeof password !== 'string' || !username.trim() || !password)
+      return res.status(400).json({ error: 'Enter your username and password.', code: 'MISSING_FIELDS' });
     let hospital = null;
     let userQuery;
 
     if (hospitalSlug) {
       hospital = await Hospital.findOne({ slug: String(hospitalSlug).toLowerCase().trim() });
       if (!hospital || hospital.status !== 'active')
-        return res.status(401).json({ error: 'Invalid credentials' });
+        return res.status(401).json({ error: BAD_LOGIN, code: 'INVALID_CREDENTIALS' });
       res.locals.auditHospitalId = hospital.id; // so login attempts show under that hospital in the audit trail
-      userQuery = { username, hospitalId: hospital.id, status: { $ne: 'inactive' } };
+      userQuery = { username: String(username).trim(), hospitalId: hospital.id, status: { $ne: 'inactive' } };
     } else {
       // No hospital selected — only the platform super admin can log in this way.
-      userQuery = { username, hospitalId: { $exists: false }, role: SUPERADMIN, status: { $ne: 'inactive' } };
+      userQuery = { username: String(username).trim(), hospitalId: { $exists: false }, role: SUPERADMIN, status: { $ne: 'inactive' } };
     }
 
     const user = await User.findOne(userQuery);
-    if (!user || !user.password || !(await bcrypt.compare(password || '', user.password)))
-      return res.status(401).json({ error: 'Invalid credentials' });
-    loginHits.delete(req.ip || 'unknown');
+    if (!user || !user.password || !(await bcrypt.compare(password, user.password)))
+      return res.status(401).json({ error: BAD_LOGIN, code: 'INVALID_CREDENTIALS' });
+    for (const k of req.loginKeys || []) loginHits.delete(k);
     const token = jwt.sign({ id: user.id, hospitalId: user.hospitalId, role: user.role, name: user.name }, SECRET, { expiresIn: '8h' });
     res.json({
       token,
       user: { id: user.id, name: user.name, role: user.role, username: user.username },
-      hospital: hospital ? { id: hospital.id, name: hospital.name, logo: hospital.logo, theme: hospital.theme, features: hospital.features, settings: hospitalSettings(hospital) } : null,
+      hospital: hospital ? hospitalPublic(hospital) : null,
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // PUBLIC (no login): just the look of one hospital — name, logo and colour — so
@@ -638,7 +799,7 @@ app.get('/api/public/branding', async (req, res) => {
     const h = await Hospital.findOne({ slug });
     if (!h) return res.status(404).json({ error: 'Not found' });
     res.json({ name: h.name, logo: h.logo || '', primaryColor: h.theme?.primaryColor || '' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // PUBLIC (no login): the platform's name, colour and logo, so the login page can
@@ -648,7 +809,7 @@ app.get('/api/public/platform', async (req, res) => {
     const p = await PlatformSettings.findOne({ key: 'platform' });
     res.set('Cache-Control', 'no-cache');
     res.json({ name: p?.name || '', color: p?.color || '', logo: p?.logo || '' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // Platform owner only: change the system name, login/platform colour and logo.
@@ -672,7 +833,7 @@ app.put('/api/platform', auth, requireRole(SUPERADMIN), async (req, res) => {
     }
     const p = await PlatformSettings.findOneAndUpdate({ key: 'platform' }, { $set: set, $setOnInsert: { key: 'platform' } }, { new: true, upsert: true });
     res.json({ name: p.name || '', color: p.color || '', logo: p.logo || '' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // The signed-in user's own hospital (name, logo, theme, enabled features), so the
@@ -683,23 +844,51 @@ app.get('/api/session', auth, async (req, res) => {
     if (!req.user.hospitalId) return res.json({ hospital: null });
     const h = await Hospital.findOne({ id: req.user.hospitalId });
     if (!h) return res.status(404).json({ error: 'Not found' });
-    res.json({ hospital: { id: h.id, name: h.name, logo: h.logo, theme: h.theme, features: h.features, settings: hospitalSettings(h) } });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    res.json({ hospital: hospitalPublic(h) });
+  } catch (err) { serverError(res, err); }
 });
 
 // A hospital's own admin changes that hospital's preferences.
 app.put('/api/hospital/settings', auth, requireRole(ADMIN), requireHospitalContext, async (req, res) => {
   try {
-    const { pharmacyPatientLink } = req.body || {};
+    const { pharmacyPatientLink, currency, departments, acceptedCurrencies, exchangeRates } = req.body || {};
     const update = {};
+    const current = await Hospital.findOne({ id: req.user.hospitalId });
+    if (!current) return res.status(404).json({ error: 'Not found' });
+    const newBase = currency !== undefined ? currency : (CURRENCIES[current.currency] ? current.currency : 'UGX');
+    if (currency !== undefined) {
+      if (!CURRENCIES[currency]) return res.status(400).json({ error: 'Choose a supported currency.' });
+      update.currency = currency;
+      // Rates are relative to the main currency, so changing it clears the extra currencies unless new rates are sent.
+      if (currency !== (current.currency || 'UGX') && acceptedCurrencies === undefined) { update['settings.acceptedCurrencies'] = []; update['settings.exchangeRates'] = {}; }
+    }
+    if (acceptedCurrencies !== undefined) {
+      if (!Array.isArray(acceptedCurrencies)) return res.status(400).json({ error: 'Accepted currencies must be a list.' });
+      const list = [...new Set(acceptedCurrencies.filter(c => c !== newBase))];
+      const rates = {};
+      for (const c of list) {
+        const r = Number(exchangeRates && exchangeRates[c]);
+        if (!CURRENCIES[c]) return res.status(400).json({ error: 'Choose supported currencies only.' });
+        if (!(r > 0) || r > 1e9) return res.status(400).json({ error: `Enter the exchange rate for ${c} (how many ${c} equal 1 ${newBase}).` });
+        rates[c] = r;
+      }
+      update['settings.acceptedCurrencies'] = list;
+      update['settings.exchangeRates'] = rates;
+    }
+    if (departments !== undefined) {
+      if (!Array.isArray(departments) || departments.length > 60) return res.status(400).json({ error: 'Departments must be a list.' });
+      const clean = [...new Set(departments.map((d) => String(d || '').trim()).filter(Boolean))];
+      if (clean.some((d) => d.length > 60)) return res.status(400).json({ error: 'A department name is too long.' });
+      update['settings.departments'] = clean;
+    }
     if (pharmacyPatientLink !== undefined) {
       if (!PHARMACY_LINK_MODES.includes(pharmacyPatientLink)) return res.status(400).json({ error: 'Invalid option' });
       update['settings.pharmacyPatientLink'] = pharmacyPatientLink;
     }
     const h = await Hospital.findOneAndUpdate({ id: req.user.hospitalId }, update, { new: true });
     if (!h) return res.status(404).json({ error: 'Not found' });
-    res.json({ settings: hospitalSettings(h) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    res.json({ settings: hospitalSettings(h), currency: CURRENCIES[h.currency] ? h.currency : 'UGX' });
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── HOSPITALS (super admin only) ────────────────────────────────────────────
@@ -707,7 +896,7 @@ app.put('/api/hospital/settings', auth, requireRole(ADMIN), requireHospitalConte
 
 app.get('/api/hospitals', auth, requireRole(SUPERADMIN), async (req, res) => {
   try { res.json(await Hospital.find()); }
-  catch (err) { res.status(500).json({ error: err.message }); }
+  catch (err) { serverError(res, err); }
 });
 
 app.post('/api/hospitals', auth, requireRole(SUPERADMIN), async (req, res) => {
@@ -716,9 +905,11 @@ app.post('/api/hospitals', auth, requireRole(SUPERADMIN), async (req, res) => {
     if (!slug) return res.status(400).json({ error: 'A hospital slug is required' });
     const exists = await Hospital.findOne({ slug });
     if (exists) return res.status(400).json({ error: 'That hospital slug is already taken' });
+    if (req.body.currency !== undefined && !CURRENCIES[req.body.currency]) return res.status(400).json({ error: 'Choose a supported currency.' });
+    if (req.body.country !== undefined && !COUNTRIES.includes(req.body.country)) return res.status(400).json({ error: 'Choose a supported country.' });
     const h = new Hospital({ ...req.body, id: uuidv4(), slug, status: req.body.status || 'active' });
     await h.save(); res.json(h);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.put('/api/hospitals/:id', auth, requireRole(SUPERADMIN), async (req, res) => {
@@ -726,6 +917,8 @@ app.put('/api/hospitals/:id', auth, requireRole(SUPERADMIN), async (req, res) =>
     const update = { ...req.body };
     delete update.id; delete update._id;
     if (update.slug) update.slug = String(update.slug).toLowerCase().trim();
+    if (update.currency !== undefined && !CURRENCIES[update.currency]) return res.status(400).json({ error: 'Choose a supported currency.' });
+    if (update.country !== undefined && !COUNTRIES.includes(update.country)) return res.status(400).json({ error: 'Choose a supported country.' });
     // Changing one feature switch (or one theme colour) must not reset the
     // others. Sent as a nested object, Mongo would replace the whole block, so
     // flatten it to "features.laboratory": true style updates instead.
@@ -738,7 +931,7 @@ app.put('/api/hospitals/:id', auth, requireRole(SUPERADMIN), async (req, res) =>
     const h = await Hospital.findOneAndUpdate({ id: req.params.id }, update, { new: true });
     if (!h) return res.status(404).json({ error: 'Not found' });
     res.json(h);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // Suspend a hospital (e.g. non-payment) — every one of its staff is locked
@@ -749,7 +942,7 @@ app.post('/api/hospitals/:id/suspend', auth, requireRole(SUPERADMIN), async (req
     const h = await Hospital.findOneAndUpdate({ id: req.params.id }, { status: 'suspended' }, { new: true });
     if (!h) return res.status(404).json({ error: 'Not found' });
     res.json(h);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // Resume a previously suspended hospital (e.g. payment received) — staff can
@@ -759,7 +952,7 @@ app.post('/api/hospitals/:id/resume', auth, requireRole(SUPERADMIN), async (req,
     const h = await Hospital.findOneAndUpdate({ id: req.params.id }, { status: 'active' }, { new: true });
     if (!h) return res.status(404).json({ error: 'Not found' });
     res.json(h);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // Convenience: create a hospital together with its first admin user in one
@@ -768,7 +961,8 @@ app.post('/api/hospitals/:id/admin', auth, requireRole(SUPERADMIN), async (req, 
   try {
     const hospital = await Hospital.findOne({ id: req.params.id });
     if (!hospital) return res.status(404).json({ error: 'Hospital not found' });
-    if (!req.body.username || !req.body.password) return res.status(400).json({ error: 'username and password are required' });
+    if (!/^[A-Za-z0-9._-]{3,40}$/.test(String(req.body.username || ''))) return res.status(400).json({ error: 'Username must be 3–40 letters, numbers, dots, dashes or underscores.', code: 'VALIDATION' });
+    if (!req.body.password || String(req.body.password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.', code: 'VALIDATION' });
     const exists = await User.findOne({ username: req.body.username, hospitalId: hospital.id });
     if (exists) return res.status(400).json({ error: 'Username already exists for this hospital' });
     const user = new User({
@@ -783,7 +977,7 @@ app.post('/api/hospitals/:id/admin', auth, requireRole(SUPERADMIN), async (req, 
     await user.save();
     const result = user.toObject(); delete result.password;
     res.json(result);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // The superadmin's dashboard: one row per hospital, so the platform owner can
@@ -821,6 +1015,7 @@ app.get('/api/hospitals/overview', auth, requireRole(SUPERADMIN), async (req, re
         totalUsers: users,
         todayAppointments: appointmentsToday,
         pendingBills: bills.filter(b => b.status === 'pending').length,
+        currency: CURRENCIES[h.currency] ? h.currency : 'UGX',
         totalRevenue: transactions.reduce((s, t) => s + (Number(t.amount) || 0), 0),
         pharmacySalesCount: pharmacySales.length,
         pharmacyRevenue: pharmacySales.reduce((s, sale) => s + (Number(sale.totalAmount) || 0), 0),
@@ -828,7 +1023,7 @@ app.get('/api/hospitals/overview', auth, requireRole(SUPERADMIN), async (req, re
       };
     }));
     res.json(overview);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── USERS ───────────────────────────────────────────────────────────────────
@@ -837,16 +1032,20 @@ app.get('/api/users', auth, requireRole(ADMIN), async (req, res) => {
   try {
     const users = await User.find(scope(req), { password: 0 });
     res.json(users);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.post('/api/users', auth, requireRole(ADMIN), requireHospitalContext, sanitizeUserRole, async (req, res) => {
   try {
-    if (!req.body.password) return res.status(400).json({ error: 'A password is required' });
-    const exists = await User.findOne({ username: req.body.username, hospitalId: req.user.hospitalId });
-    if (exists) return res.status(400).json({ error: 'Username already exists' });
+    const { name, username, password, role } = req.body || {};
+    if (!String(name || '').trim()) return res.status(400).json({ error: 'Enter the person\'s full name.', code: 'VALIDATION' });
+    if (!/^[A-Za-z0-9._-]{3,40}$/.test(String(username || ''))) return res.status(400).json({ error: 'Username must be 3–40 letters, numbers, dots, dashes or underscores (no spaces).', code: 'VALIDATION' });
+    if (!password || String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.', code: 'VALIDATION' });
+    if (!role) return res.status(400).json({ error: 'Please choose a role.', code: 'INVALID_ROLE' });
+    const exists = await User.findOne({ username, hospitalId: req.user.hospitalId });
+    if (exists) return res.status(409).json({ error: 'That username is already taken in this hospital.', code: 'DUPLICATE' });
     const user = new User({
-      ...req.body,
+      name: String(name).trim(), username, role,
       id: uuidv4(),
       hospitalId: req.user.hospitalId,
       password: await bcrypt.hash(req.body.password, 10),
@@ -856,7 +1055,7 @@ app.post('/api/users', auth, requireRole(ADMIN), requireHospitalContext, sanitiz
     const result = user.toObject();
     delete result.password;
     res.json(result);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.put('/api/users/:id', auth, requireRole(ADMIN), protectSuperAdmin, sanitizeUserRole, async (req, res) => {
@@ -865,10 +1064,11 @@ app.put('/api/users/:id', auth, requireRole(ADMIN), protectSuperAdmin, sanitizeU
     delete update.id; delete update._id; delete update.hospitalId; // never let a client move a user between hospitals
     if (req.body.password) update.password = await bcrypt.hash(req.body.password, 10);
     else delete update.password;
-    const user = await User.findOneAndUpdate({ id: req.params.id, ...scope(req) }, update, { new: true, projection: { password: 0 } });
-    if (!user) return res.status(404).json({ error: 'Not found' });
+    const found = await User.findOneAndUpdate({ id: req.params.id, ...scope(req) }, update, { new: true });
+    if (!found) return res.status(404).json({ error: 'Not found' });
+    const user = found.toObject(); delete user.password;
     res.json(user);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.put('/api/users/:id/password', auth, requireRole(ADMIN), protectSuperAdmin, async (req, res) => {
@@ -881,7 +1081,7 @@ app.put('/api/users/:id/password', auth, requireRole(ADMIN), protectSuperAdmin, 
     target.password = await bcrypt.hash(newPassword, 10);
     await target.save();
     res.json({ success: true, generated, password: generated ? newPassword : undefined });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.delete('/api/users/:id', auth, requireRole(ADMIN), protectSuperAdmin, async (req, res) => {
@@ -889,7 +1089,7 @@ app.delete('/api/users/:id', auth, requireRole(ADMIN), protectSuperAdmin, async 
     if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot delete yourself' });
     await User.findOneAndDelete({ id: req.params.id, ...scope(req) });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── AUDIT LOGS (super admin only) ───────────────────────────────────────────
@@ -919,7 +1119,7 @@ app.get('/api/audit-logs/meta', auth, requireRole(SUPERADMIN), async (req, res) 
       entities: entities.filter(Boolean).sort(),
       actors: actors.map(a => ({ id: a._id, name: a.name, role: a.role })),
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 function auditRangeFilter(from, to) {
@@ -947,7 +1147,7 @@ app.get('/api/audit-logs', auth, requireRole(SUPERADMIN), async (req, res) => {
     ]);
     res.setHeader('X-Total-Count', String(total));
     res.json(logs);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // Clear audit history (super admin only). Deletes ONLY audit entries, never
@@ -967,7 +1167,7 @@ app.delete('/api/audit-logs', auth, requireRole(SUPERADMIN), async (req, res) =>
     }
     const r = await AuditLog.deleteMany(q);
     res.json({ deleted: r.deletedCount });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── PATIENTS ────────────────────────────────────────────────────────────────
@@ -982,33 +1182,40 @@ app.get('/api/patients', auth, requireRole(ADMIN, RECEPTIONIST, DOCTOR), async (
     if (q) {
       const safe = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // escape regex special characters
       const regex = new RegExp(safe, 'i');
-      filter.$or = [{ name: regex }, { phone: regex }, { email: regex }];
+      filter.$or = [{ name: regex }, { phone: regex }, { email: regex }, { patientNumber: regex }];
     }
-    res.json(await Patient.find(filter));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    // limit: used by the type-ahead pickers so they never download every patient.
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 0, 0), 200);
+    let cursor = Patient.find(filter);
+    if (limit) cursor = cursor.sort({ name: 1 }).limit(limit);
+    res.json(await cursor);
+  } catch (err) { serverError(res, err); }
 });
 
 app.post('/api/patients', auth, requireRole(ADMIN, RECEPTIONIST), requireHospitalContext, async (req, res) => {
   try {
-    const p = new Patient({ ...req.body, id: uuidv4(), hospitalId: req.user.hospitalId });
+    const body = { ...req.body }; delete body.patientNumber; delete body._id;
+    if (!String(body.name || '').trim()) return res.status(400).json({ error: 'Enter the patient\'s name.', code: 'VALIDATION' });
+    body.name = String(body.name).trim();
+    const p = new Patient({ ...body, id: uuidv4(), hospitalId: req.user.hospitalId, patientNumber: await nextPatientNumber(req.user.hospitalId) });
     await p.save(); res.json(p);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.put('/api/patients/:id', auth, requireRole(ADMIN, RECEPTIONIST), async (req, res) => {
   try {
-    const update = { ...req.body }; delete update.hospitalId;
+    const update = { ...req.body }; delete update.hospitalId; delete update.patientNumber; delete update.id; delete update._id;
     const p = await Patient.findOneAndUpdate({ id: req.params.id, ...scope(req) }, update, { new: true });
     if (!p) return res.status(404).json({ error: 'Not found' });
     res.json(p);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.delete('/api/patients/:id', auth, requireRole(ADMIN), async (req, res) => {
   try {
     await Patient.findOneAndDelete({ id: req.params.id, ...scope(req) });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // One patient's full history in a single call — every past appointment,
@@ -1062,67 +1269,141 @@ app.get('/api/patients/:id/history', auth, requireRole(ADMIN, DOCTOR, RECEPTIONI
         pharmacyTotal,
       },
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
+
+// Older rows were saved without the patient's/doctor's name: fill them in on the way out.
+async function withNames(rows, req) {
+  const list = rows.map(r => (r.toObject ? r.toObject() : r));
+  const need = (k, nk) => [...new Set(list.filter(r => r[k] && !r[nk]).map(r => r[k]))];
+  const pIds = need('patientId', 'patientName'), dIds = need('doctorId', 'doctorName');
+  const [ps, ds] = await Promise.all([
+    pIds.length ? Patient.find({ id: { $in: pIds }, ...scope(req) }, { id: 1, name: 1 }) : [],
+    dIds.length ? Doctor.find({ id: { $in: dIds }, ...scope(req) }, { id: 1, name: 1 }) : [],
+  ]);
+  const pm = Object.fromEntries(ps.map(p => [p.id, p.name])), dm = Object.fromEntries(ds.map(d => [d.id, d.name]));
+  return list.map(r => ({ ...r, patientName: r.patientName || pm[r.patientId], doctorName: r.doctorName || dm[r.doctorId] }));
+}
+
+// ─── DROPDOWN OPTIONS ────────────────────────────────────────────────────────
+// One call gives the browser every list it needs for dropdowns. Departments come
+// from the signed-in hospital's own settings; the rest are platform-wide lists.
+app.get('/api/meta/options', auth, async (req, res) => {
+  try {
+    let departments = DEFAULT_DEPARTMENTS;
+    if (req.user.hospitalId) {
+      const h = await Hospital.findOne({ id: req.user.hospitalId });
+      if (h) departments = hospitalSettings(h).departments;
+    }
+    res.json({
+      departments,
+      qualifications: QUALIFICATIONS,
+      staffRoles: STAFF_ROLES,
+      currencies: Object.entries(CURRENCIES).map(([code, c]) => ({ code, ...c })),
+      countries: COUNTRIES,
+      // Roles the signed-in user may hand out to others.
+      assignableRoles: req.user.role === SUPERADMIN ? [...ASSIGNABLE_ROLES] : [...ASSIGNABLE_ROLES].filter(r => r !== ADMIN),
+    });
+  } catch (err) { serverError(res, err); }
+});
+
+// Department and qualification must be a real choice (departments: from THIS hospital).
+async function checkChoices(req, { department, qualification, staffRole }, existing) {
+  // On edit, a value the record already had (maybe typed freely before this list existed) is left alone.
+  if (existing) {
+    if (department === existing.department) department = undefined;
+    if (qualification === existing.qualification) qualification = undefined;
+    if (staffRole === existing.role) staffRole = undefined;
+  }
+  if (department) {
+    const h = await Hospital.findOne({ id: req.user.hospitalId });
+    if (!hospitalSettings(h).departments.includes(department)) return 'Please choose a department from the list.';
+  }
+  if (qualification && !QUALIFICATIONS.includes(qualification)) return 'Please choose a qualification from the list.';
+  if (staffRole && !STAFF_ROLES.includes(staffRole)) return 'Please choose a valid staff role.';
+  return null;
+}
 
 // ─── DOCTORS ─────────────────────────────────────────────────────────────────
 
 app.get('/api/doctors', auth, requireRole(ADMIN, RECEPTIONIST, DOCTOR), async (req, res) => {
   try { res.json(await Doctor.find(scope(req))); }
-  catch (err) { res.status(500).json({ error: err.message }); }
+  catch (err) { serverError(res, err); }
 });
 
 app.post('/api/doctors', auth, requireRole(ADMIN), requireHospitalContext, async (req, res) => {
   try {
-    const d = new Doctor({ ...req.body, id: uuidv4(), hospitalId: req.user.hospitalId });
+    if (!String(req.body.name || '').trim()) return res.status(400).json({ error: 'Enter the doctor\'s name.', code: 'VALIDATION' });
+    const bad = await checkChoices(req, req.body); if (bad) return res.status(400).json({ error: bad, code: 'VALIDATION' });
+    if (req.body.linkedUserId) {
+      const u = await User.findOne({ id: req.body.linkedUserId, hospitalId: req.user.hospitalId, role: DOCTOR });
+      if (!u) return res.status(400).json({ error: 'The linked login account must be a doctor account of this hospital.', code: 'VALIDATION' });
+    }
+    const body = { ...req.body }; delete body._id;
+    const d = new Doctor({ ...body, id: uuidv4(), hospitalId: req.user.hospitalId });
     await d.save(); res.json(d);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.put('/api/doctors/:id', auth, requireRole(ADMIN), async (req, res) => {
   try {
-    const update = { ...req.body }; delete update.hospitalId;
+    const update = { ...req.body }; delete update.hospitalId; delete update.id; delete update._id;
+    const before = await Doctor.findOne({ id: req.params.id, ...scope(req) });
+    if (!before) return res.status(404).json({ error: 'Not found' });
+    const bad = await checkChoices(req, update, before); if (bad) return res.status(400).json({ error: bad, code: 'VALIDATION' });
+    if (update.linkedUserId && update.linkedUserId !== before.linkedUserId) {
+      const u = await User.findOne({ id: update.linkedUserId, ...scope(req), role: DOCTOR });
+      if (!u) return res.status(400).json({ error: 'The linked login account must be a doctor account of this hospital.', code: 'VALIDATION' });
+    }
     const d = await Doctor.findOneAndUpdate({ id: req.params.id, ...scope(req) }, update, { new: true });
     if (!d) return res.status(404).json({ error: 'Not found' });
     res.json(d);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.delete('/api/doctors/:id', auth, requireRole(ADMIN), async (req, res) => {
   try {
     await Doctor.findOneAndDelete({ id: req.params.id, ...scope(req) });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── STAFF ───────────────────────────────────────────────────────────────────
 
 app.get('/api/staff', auth, requireRole(ADMIN), async (req, res) => {
   try { res.json(await Staff.find(scope(req))); }
-  catch (err) { res.status(500).json({ error: err.message }); }
+  catch (err) { serverError(res, err); }
 });
 
 app.post('/api/staff', auth, requireRole(ADMIN), requireHospitalContext, async (req, res) => {
   try {
-    const s = new Staff({ ...req.body, id: uuidv4(), hospitalId: req.user.hospitalId });
+    if (!String(req.body.name || '').trim()) return res.status(400).json({ error: 'Enter the staff member\'s name.', code: 'VALIDATION' });
+    if (!req.body.role) return res.status(400).json({ error: 'Please choose a role.', code: 'INVALID_ROLE' });
+    const bad = await checkChoices(req, { department: req.body.department, staffRole: req.body.role }); if (bad) return res.status(400).json({ error: bad, code: 'VALIDATION' });
+    const body = { ...req.body }; delete body._id;
+    if (body.salary !== undefined && body.salary !== '' && !(Number(body.salary) >= 0)) return res.status(400).json({ error: 'Salary must be a positive number.', code: 'VALIDATION' });
+    const s = new Staff({ ...body, id: uuidv4(), hospitalId: req.user.hospitalId });
     await s.save(); res.json(s);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.put('/api/staff/:id', auth, requireRole(ADMIN), async (req, res) => {
   try {
-    const update = { ...req.body }; delete update.hospitalId;
+    const update = { ...req.body }; delete update.hospitalId; delete update.id; delete update._id;
+    const before = await Staff.findOne({ id: req.params.id, ...scope(req) });
+    if (!before) return res.status(404).json({ error: 'Not found' });
+    const bad = await checkChoices(req, { department: update.department, staffRole: update.role }, before); if (bad) return res.status(400).json({ error: bad, code: 'VALIDATION' });
     const s = await Staff.findOneAndUpdate({ id: req.params.id, ...scope(req) }, update, { new: true });
     if (!s) return res.status(404).json({ error: 'Not found' });
     res.json(s);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.delete('/api/staff/:id', auth, requireRole(ADMIN), async (req, res) => {
   try {
     await Staff.findOneAndDelete({ id: req.params.id, ...scope(req) });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── APPOINTMENTS ─────────────────────────────────────────────────────────────
@@ -1134,31 +1415,55 @@ app.get('/api/appointments', auth, requireRole(ADMIN, RECEPTIONIST, DOCTOR), asy
       const doc = await Doctor.findOne({ linkedUserId: req.user.id, ...scope(req) });
       filter.doctorId = doc ? doc.id : '__no_linked_doctor__';
     }
-    res.json(await Appointment.find(filter));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    res.json(await withNames(await Appointment.find(filter), req));
+  } catch (err) { serverError(res, err); }
 });
 
 app.post('/api/appointments', auth, requireRole(ADMIN, RECEPTIONIST), requireHospitalContext, async (req, res) => {
   try {
-    const a = new Appointment({ ...req.body, id: uuidv4(), hospitalId: req.user.hospitalId, status: 'scheduled' });
+    const { patientId, doctorId, date, time } = req.body || {};
+    if (!patientId) return res.status(400).json({ error: 'Please choose a patient from the list.', code: 'VALIDATION' });
+    if (!date) return res.status(400).json({ error: 'Choose the appointment date.', code: 'VALIDATION' });
+    // The patient (and doctor) must really belong to THIS hospital; names are copied from the database, not trusted from the browser.
+    const patient = await Patient.findOne({ id: patientId, hospitalId: req.user.hospitalId });
+    if (!patient) return res.status(400).json({ error: 'That patient was not found in this hospital.', code: 'VALIDATION' });
+    let doctor = null;
+    if (doctorId) {
+      doctor = await Doctor.findOne({ id: doctorId, hospitalId: req.user.hospitalId });
+      if (!doctor) return res.status(400).json({ error: 'That doctor was not found in this hospital.', code: 'VALIDATION' });
+    }
+    const dup = await Appointment.findOne({ hospitalId: req.user.hospitalId, patientId, doctorId: doctorId || null, date, time: time || null, status: { $ne: 'cancelled' } });
+    if (dup) return res.status(409).json({ error: 'This patient already has an appointment at that date and time.', code: 'DUPLICATE' });
+    const body = { ...req.body }; delete body._id;
+    const a = new Appointment({ ...body, doctorId: doctor ? doctor.id : undefined, id: uuidv4(), hospitalId: req.user.hospitalId, patientName: patient.name, doctorName: doctor ? doctor.name : undefined, status: 'scheduled' });
     await a.save(); res.json(a);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.put('/api/appointments/:id', auth, requireRole(ADMIN, RECEPTIONIST, DOCTOR), async (req, res) => {
   try {
-    const update = { ...req.body }; delete update.hospitalId;
+    const update = { ...req.body }; delete update.hospitalId; delete update.id; delete update._id;
+    if (update.patientId) {
+      const pt = await Patient.findOne({ id: update.patientId, ...scope(req) });
+      if (!pt) return res.status(400).json({ error: 'That patient was not found in this hospital.', code: 'VALIDATION' });
+      update.patientName = pt.name;
+    }
+    if (update.doctorId) {
+      const dc = await Doctor.findOne({ id: update.doctorId, ...scope(req) });
+      if (!dc) return res.status(400).json({ error: 'That doctor was not found in this hospital.', code: 'VALIDATION' });
+      update.doctorName = dc.name;
+    }
     const a = await Appointment.findOneAndUpdate({ id: req.params.id, ...scope(req) }, update, { new: true });
     if (!a) return res.status(404).json({ error: 'Not found' });
     res.json(a);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.delete('/api/appointments/:id', auth, requireRole(ADMIN, RECEPTIONIST), async (req, res) => {
   try {
     await Appointment.findOneAndDelete({ id: req.params.id, ...scope(req) });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── MEDICAL RECORDS ──────────────────────────────────────────────────────────
@@ -1172,24 +1477,36 @@ app.get('/api/records', auth, requireRole(ADMIN, DOCTOR, RECEPTIONIST), async (r
       const doc = await Doctor.findOne({ linkedUserId: req.user.id, ...scope(req) });
       filter.doctorId = doc ? doc.id : '__no_linked_doctor__';
     }
-    res.json(await MedicalRecord.find(filter));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    res.json(await withNames(await MedicalRecord.find(filter), req));
+  } catch (err) { serverError(res, err); }
 });
 
 app.post('/api/records', auth, requireRole(ADMIN, DOCTOR), requireHospitalContext, async (req, res) => {
   try {
-    const r = new MedicalRecord({ ...req.body, id: uuidv4(), hospitalId: req.user.hospitalId, createdBy: req.user.id });
+    const { patientId } = req.body || {};
+    if (!patientId) return res.status(400).json({ error: 'Please choose a patient from the list.', code: 'VALIDATION' });
+    const patient = await Patient.findOne({ id: patientId, hospitalId: req.user.hospitalId });
+    if (!patient) return res.status(400).json({ error: 'That patient was not found in this hospital.', code: 'VALIDATION' });
+    let doctorId = req.body.doctorId;
+    if (req.user.role === DOCTOR) { const mine = await Doctor.findOne({ linkedUserId: req.user.id, hospitalId: req.user.hospitalId }); if (mine) doctorId = mine.id; }
+    let doctor = null;
+    if (doctorId) {
+      doctor = await Doctor.findOne({ id: doctorId, hospitalId: req.user.hospitalId });
+      if (!doctor) return res.status(400).json({ error: 'That doctor was not found in this hospital.', code: 'VALIDATION' });
+    }
+    const body = { ...req.body }; delete body._id;
+    const r = new MedicalRecord({ ...body, doctorId: doctor ? doctor.id : undefined, patientName: patient.name, doctorName: doctor ? doctor.name : undefined, id: uuidv4(), hospitalId: req.user.hospitalId, createdBy: req.user.id });
     await r.save(); res.json(r);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.put('/api/records/:id', auth, requireRole(ADMIN, DOCTOR), async (req, res) => {
   try {
-    const update = { ...req.body }; delete update.hospitalId;
+    const update = { ...req.body }; delete update.hospitalId; delete update.id; delete update._id; delete update.createdBy; delete update.patientId;
     const r = await MedicalRecord.findOneAndUpdate({ id: req.params.id, ...scope(req) }, update, { new: true });
     if (!r) return res.status(404).json({ error: 'Not found' });
     res.json(r);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── TREATMENT PLANS ──────────────────────────────────────────────────────────
@@ -1205,7 +1522,7 @@ app.get('/api/treatment-plans', auth, requireRole(ADMIN, DOCTOR, RECEPTIONIST), 
       filter.doctorId = doc ? doc.id : '__no_linked_doctor__';
     }
     res.json(await TreatmentPlan.find(filter).sort({ createdAt: -1 }));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.post('/api/treatment-plans', auth, requireRole(ADMIN, DOCTOR), requireFeature('treatmentPlans'), requireHospitalContext, async (req, res) => {
@@ -1218,7 +1535,7 @@ app.post('/api/treatment-plans', auth, requireRole(ADMIN, DOCTOR), requireFeatur
       status: req.body.status || 'active',
     });
     await p.save(); res.json(p);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.put('/api/treatment-plans/:id', auth, requireRole(ADMIN, DOCTOR), requireFeature('treatmentPlans'), async (req, res) => {
@@ -1227,7 +1544,7 @@ app.put('/api/treatment-plans/:id', auth, requireRole(ADMIN, DOCTOR), requireFea
     const p = await TreatmentPlan.findOneAndUpdate({ id: req.params.id, ...scope(req) }, update, { new: true });
     if (!p) return res.status(404).json({ error: 'Not found' });
     res.json(p);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── REFERRALS (within one hospital only) ────────────────────────────────────
@@ -1247,7 +1564,7 @@ app.get('/api/referrals', auth, requireRole(ADMIN, DOCTOR, RECEPTIONIST), requir
       filter.$or = [{ fromDoctorId: docId }, { toDoctorId: docId }];
     }
     res.json(await Referral.find(filter).sort({ createdAt: -1 }));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.post('/api/referrals', auth, requireRole(ADMIN, DOCTOR), requireFeature('referrals'), requireHospitalContext, async (req, res) => {
@@ -1268,7 +1585,7 @@ app.post('/api/referrals', auth, requireRole(ADMIN, DOCTOR), requireFeature('ref
       status: 'pending',
     });
     await r.save(); res.json(r);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // Accept, decline, or complete a referral, or edit its notes/department.
@@ -1282,7 +1599,7 @@ app.put('/api/referrals/:id', auth, requireRole(ADMIN, DOCTOR), requireFeature('
     const r = await Referral.findOneAndUpdate({ id: req.params.id, ...scope(req) }, update, { new: true });
     if (!r) return res.status(404).json({ error: 'Not found' });
     res.json(r);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── LABORATORY (feature-gated: laboratory) ──────────────────────────────────
@@ -1299,7 +1616,7 @@ app.get('/api/lab-orders', auth, requireRole(ADMIN, DOCTOR, LAB_STAFF), requireF
     // A doctor sees the orders they placed, not every order at the hospital.
     if (req.user.role === DOCTOR) filter.orderedById = req.user.id;
     res.json(await LabOrder.find(filter).sort({ createdAt: -1 }));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.post('/api/lab-orders', auth, requireRole(ADMIN, DOCTOR), requireFeature('laboratory'), requireHospitalContext, async (req, res) => {
@@ -1345,7 +1662,7 @@ app.post('/api/lab-orders', auth, requireRole(ADMIN, DOCTOR), requireFeature('la
       status: 'pending',
     });
     await order.save(); res.json(order);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // Lab staff update an order: move it along, and enter results. Only the
@@ -1391,7 +1708,7 @@ app.put('/api/lab-orders/:id', auth, requireRole(ADMIN, LAB_STAFF), requireFeatu
     }
 
     await order.save(); res.json(order);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── INPATIENT (feature-gated: inpatient) ────────────────────────────────────
@@ -1402,7 +1719,7 @@ const BED_STATUSES = new Set(['available', 'maintenance']); // 'occupied' is onl
 
 app.get('/api/wards', auth, requireRole(ADMIN, DOCTOR, RECEPTIONIST), requireFeature('inpatient'), async (req, res) => {
   try { res.json(await Ward.find(scope(req)).sort({ name: 1 })); }
-  catch (err) { res.status(500).json({ error: err.message }); }
+  catch (err) { serverError(res, err); }
 });
 
 app.post('/api/wards', auth, requireRole(ADMIN), requireFeature('inpatient'), requireHospitalContext, async (req, res) => {
@@ -1422,7 +1739,7 @@ app.post('/api/wards', auth, requireRole(ADMIN), requireFeature('inpatient'), re
       beds: Array.from({ length: bedCount }, (_, i) => ({ number: String(i + 1), status: 'available' })),
     });
     await ward.save(); res.json(ward);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // Rename / re-rate a ward, add beds, or put a free bed in/out of maintenance.
@@ -1457,7 +1774,7 @@ app.put('/api/wards/:id', auth, requireRole(ADMIN), requireFeature('inpatient'),
       bed.status = status;
     }
     await ward.save(); res.json(ward);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.get('/api/admissions', auth, requireRole(ADMIN, DOCTOR, RECEPTIONIST), requireFeature('inpatient'), async (req, res) => {
@@ -1468,7 +1785,7 @@ app.get('/api/admissions', auth, requireRole(ADMIN, DOCTOR, RECEPTIONIST), requi
     if (patientId) filter.patientId = patientId;
     if (wardId) filter.wardId = wardId;
     res.json(await Admission.find(filter).sort({ admittedAt: -1 }));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.get('/api/admissions/:id', auth, requireRole(ADMIN, DOCTOR, RECEPTIONIST), requireFeature('inpatient'), async (req, res) => {
@@ -1476,7 +1793,7 @@ app.get('/api/admissions/:id', auth, requireRole(ADMIN, DOCTOR, RECEPTIONIST), r
     const a = await Admission.findOne({ id: req.params.id, ...scope(req) });
     if (!a) return res.status(404).json({ error: 'Not found' });
     res.json(a);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.post('/api/admissions', auth, requireRole(ADMIN, DOCTOR, RECEPTIONIST), requireFeature('inpatient'), requireHospitalContext, async (req, res) => {
@@ -1528,7 +1845,7 @@ app.post('/api/admissions', auth, requireRole(ADMIN, DOCTOR, RECEPTIONIST), requ
       );
       throw e;
     }
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // Daily progress notes on an inpatient.
@@ -1544,7 +1861,7 @@ app.post('/api/admissions/:id/notes', auth, requireRole(ADMIN, DOCTOR), requireF
     );
     if (!a) return res.status(404).json({ error: 'No current admission found with that id (already discharged?)' });
     res.json(a);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // Discharge: closes the stay, frees the bed, and — if the hospital has billing
@@ -1614,21 +1931,21 @@ app.post('/api/admissions/:id/discharge', auth, requireRole(ADMIN, DOCTOR), requ
     }
 
     res.json({ admission: a, bill, ...(billError ? { billError } : {}) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── INVENTORY (feature-gated: pharmacy) ──────────────────────────────────────
 
 app.get('/api/inventory', auth, requireRole(ADMIN, PHARMACIST, DOCTOR), requireFeature('pharmacy'), async (req, res) => {
   try { res.json(await Inventory.find(scope(req))); }
-  catch (err) { res.status(500).json({ error: err.message }); }
+  catch (err) { serverError(res, err); }
 });
 
 app.post('/api/inventory', auth, requireRole(ADMIN, PHARMACIST), requireFeature('pharmacy'), requireHospitalContext, async (req, res) => {
   try {
     const i = new Inventory({ ...req.body, id: uuidv4(), hospitalId: req.user.hospitalId });
     await i.save(); res.json(i);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.put('/api/inventory/:id', auth, requireRole(ADMIN, PHARMACIST), requireFeature('pharmacy'), async (req, res) => {
@@ -1637,14 +1954,14 @@ app.put('/api/inventory/:id', auth, requireRole(ADMIN, PHARMACIST), requireFeatu
     const i = await Inventory.findOneAndUpdate({ id: req.params.id, ...scope(req) }, update, { new: true });
     if (!i) return res.status(404).json({ error: 'Not found' });
     res.json(i);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.delete('/api/inventory/:id', auth, requireRole(ADMIN, PHARMACIST), requireFeature('pharmacy'), async (req, res) => {
   try {
     await Inventory.findOneAndDelete({ id: req.params.id, ...scope(req) });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── PHARMACY SALES (feature-gated: pharmacy) ────────────────────────────────
@@ -1724,7 +2041,7 @@ app.post('/api/pharmacy-sales', auth, requireRole(ADMIN, PHARMACIST), requireFea
     });
     await sale.save();
     res.json(sale);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // Lets the pharmacy find a registered patient to attach a sale to. Pharmacists
@@ -1736,7 +2053,7 @@ app.get('/api/pharmacy-sales/patient-search', auth, requireRole(ADMIN, PHARMACIS
     const rx = new RegExp(q.slice(0, 60).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
     const found = await Patient.find({ ...scope(req), $or: [{ name: rx }, { phone: rx }] }).limit(10);
     res.json(found.map(p => ({ id: p.id, name: p.name, phone: p.phone, age: p.age, gender: p.gender })));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.get('/api/pharmacy-sales', auth, requireRole(ADMIN, PHARMACIST), requireFeature('pharmacy'), async (req, res) => {
@@ -1750,65 +2067,103 @@ app.get('/api/pharmacy-sales', auth, requireRole(ADMIN, PHARMACIST), requireFeat
     }
     const sales = await PharmacySale.find(q).sort({ createdAt: -1 });
     res.json(sales);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── BILLING (feature-gated: billing) ─────────────────────────────────────────
 
 app.get('/api/bills', auth, requireRole(ADMIN, RECEPTIONIST), requireFeature('billing'), async (req, res) => {
-  try { res.json(await Bill.find(scope(req))); }
-  catch (err) { res.status(500).json({ error: err.message }); }
+  try { res.json(await withNames(await Bill.find(scope(req)), req)); }
+  catch (err) { serverError(res, err); }
 });
 
 app.post('/api/bills', auth, requireRole(ADMIN, RECEPTIONIST), requireFeature('billing'), requireHospitalContext, async (req, res) => {
   try {
     const { total, totalAmount: bodyTotal, ...rest } = req.body;
+    delete rest._id; delete rest.paidAmount; delete rest.remainingAmount; delete rest.status;
     const totalAmount = Number(bodyTotal ?? total) || 0;
+    if (!(totalAmount > 0)) return res.status(400).json({ error: 'A bill needs at least one item with an amount greater than zero.', code: 'VALIDATION' });
+    if (!rest.patientId) return res.status(400).json({ error: 'Please choose a patient.', code: 'VALIDATION' });
+    const patient = await Patient.findOne({ id: rest.patientId, hospitalId: req.user.hospitalId });
+    if (!patient) return res.status(400).json({ error: 'That patient was not found in this hospital.', code: 'VALIDATION' });
     const b = new Bill({
       ...rest,
+      patientName: patient.name,
       id: uuidv4(),
       hospitalId: req.user.hospitalId,
-      billNumber: `BILL-${Date.now()}`,
+      billNumber: `BILL-${String(await nextSeq(`bill:${req.user.hospitalId}`)).padStart(6, '0')}`,
       status: 'pending',
       paidAmount: 0,
       totalAmount,
       remainingAmount: totalAmount,
     });
     await b.save(); res.json(b);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.put('/api/bills/:id', auth, requireRole(ADMIN, RECEPTIONIST), requireFeature('billing'), async (req, res) => {
   try {
-    const update = { ...req.body }; delete update.hospitalId;
+    // Money fields are only ever changed by recording payments, never by a direct edit.
+    const update = {}; if (req.body.notes !== undefined) update.notes = String(req.body.notes).slice(0, 1000);
     const b = await Bill.findOneAndUpdate({ id: req.params.id, ...scope(req) }, update, { new: true });
     if (!b) return res.status(404).json({ error: 'Not found' });
     res.json(b);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── TRANSACTIONS (feature-gated: billing) ────────────────────────────────────
 
 app.get('/api/transactions', auth, requireRole(ADMIN, RECEPTIONIST), requireFeature('billing'), async (req, res) => {
-  try { res.json(await Transaction.find(scope(req))); }
-  catch (err) { res.status(500).json({ error: err.message }); }
+  try { res.json(await withNames(await Transaction.find(scope(req)), req)); }
+  catch (err) { serverError(res, err); }
 });
 
 app.post('/api/transactions', auth, requireRole(ADMIN, RECEPTIONIST), requireFeature('billing'), requireHospitalContext, async (req, res) => {
   try {
-    const amount = Number(req.body.amount) || 0;
-    let patientName = req.body.patientName;
-    if (!patientName && req.body.patientId) {
-      const p = await Patient.findOne({ id: req.body.patientId, ...scope(req) });
-      patientName = p?.name;
+    // The patient may pay in any currency this hospital accepts. We keep the amount in the MAIN
+    // currency (so bills and totals stay correct) and remember what was really handed over.
+    const hosp = await Hospital.findOne({ id: req.user.hospitalId });
+    const base = CURRENCIES[hosp?.currency] ? hosp.currency : 'UGX';
+    const hs = hospitalSettings(hosp);
+    const payCur = req.body.currency || base;
+    if (!hs.acceptedCurrencies.includes(payCur)) return res.status(400).json({ error: 'This hospital does not accept that currency. Choose one from the list.', code: 'VALIDATION' });
+    const rate = payCur === base ? 1 : hs.exchangeRates[payCur];
+    const tendered = Number(req.body.amount) || 0;
+    if (!(tendered > 0)) return res.status(400).json({ error: 'Enter an amount greater than zero.', code: 'VALIDATION' });
+    const dec = CURRENCIES[base].decimals;
+    const round = (n) => Math.round(n * 10 ** dec) / 10 ** dec;
+    let amount = round(tendered / rate);
+    if (!(amount > 0)) return res.status(400).json({ error: 'That amount is too small to record.', code: 'VALIDATION' });
+    let bill = null;
+    if (req.body.billId) {
+      bill = await Bill.findOne({ id: req.body.billId, hospitalId: req.user.hospitalId });
+      if (!bill) return res.status(400).json({ error: 'That bill was not found in this hospital.', code: 'VALIDATION' });
+      if (bill.status === 'paid' || Number(bill.remainingAmount) <= 0) return res.status(409).json({ error: 'This bill is already fully paid.', code: 'DUPLICATE' });
+      const owed = Number(bill.remainingAmount);
+      // Converting between currencies rounds a little; allow up to half a percent (or one smallest unit) over and settle exactly.
+      const tolerance = payCur === base ? 0.0001 : Math.max(10 ** -dec, owed * 0.005);
+      if (amount > owed + tolerance) return res.status(400).json({ error: 'The payment is more than the amount still owed on this bill.', code: 'VALIDATION' });
+      if (amount > owed) amount = owed;
     }
+    const patientId = req.body.patientId || (bill && bill.patientId);
+    let patientName;
+    if (patientId) {
+      const p = await Patient.findOne({ id: patientId, hospitalId: req.user.hospitalId });
+      if (!p) return res.status(400).json({ error: 'That patient was not found in this hospital.', code: 'VALIDATION' });
+      patientName = p.name;
+    }
+    const { _id, currency: _c, tenderedCurrency: _tc, tenderedAmount: _ta, exchangeRate: _er, ...txBody } = req.body;
     const tx = new Transaction({
-      ...req.body,
+      ...txBody,
+      patientId,
       amount,
+      tenderedCurrency: payCur,
+      tenderedAmount: payCur === base ? amount : tendered,
+      exchangeRate: rate,
       patientName,
       id: uuidv4(),
       hospitalId: req.user.hospitalId,
-      txRef: `TXN-${Date.now()}`,
+      txRef: `TXN-${String(await nextSeq(`tx:${req.user.hospitalId}`)).padStart(6, '0')}`,
       recordedBy: req.user.name,
     });
     await tx.save();
@@ -1831,14 +2186,14 @@ app.post('/api/transactions', auth, requireRole(ADMIN, RECEPTIONIST), requireFea
     // ─────────────────────────────────────────────────────────────────────────
 
     res.json(tx);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 app.delete('/api/transactions/:id', auth, requireRole(ADMIN), requireFeature('billing'), async (req, res) => {
   try {
     await Transaction.findOneAndDelete({ id: req.params.id, ...scope(req) });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── DASHBOARD STATS ──────────────────────────────────────────────────────────
@@ -1889,7 +2244,13 @@ app.get('/api/stats', auth, async (req, res) => {
           AuditLog.find().sort({ timestamp: -1 }).limit(8),
         ]);
         const allPharmacySales = await PharmacySale.find();
+        // Money in different currencies must never be added together.
+        const hospCur = Object.fromEntries((await Hospital.find({}, { id: 1, currency: 1 })).map(h => [h.id, CURRENCIES[h.currency] ? h.currency : 'UGX']));
+        const allTx = await Transaction.find({}, { amount: 1, hospitalId: 1 });
+        const revenueByCurrency = {};
+        for (const t of allTx) { const c = hospCur[t.hospitalId] || 'UGX'; revenueByCurrency[c] = (revenueByCurrency[c] || 0) + (Number(t.amount) || 0); }
         Object.assign(stats, {
+          revenueByCurrency,
           totalHospitals,
           activeHospitals,
           usersByRole,
@@ -1962,7 +2323,7 @@ app.get('/api/stats', auth, async (req, res) => {
     }
 
     res.json(stats);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { serverError(res, err); }
 });
 
 // ─── SEED ADMIN (dev convenience — only on a completely empty database) ─────
@@ -2036,5 +2397,6 @@ const PORT = process.env.PORT || 4000;
 connect().then(async () => {
   await seedAdmin();
   await seedSuperAdmin();
+  await backfillPatientNumbers().catch(e => console.error('⚠️  patient number backfill failed:', e.message));
   app.listen(PORT, () => console.log(`🏥 HMS Backend running on http://localhost:${PORT}`));
 });
