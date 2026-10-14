@@ -149,6 +149,12 @@ const HospitalSchema = new mongoose.Schema({
 const Hospital = mongoose.model('Hospital', HospitalSchema);
 // Hospitals created before settings existed simply get the defaults.
 const PHARMACY_LINK_MODES = ['off', 'optional', 'required'];
+// A money amount from a form: a number, zero or more, within reason. Anything else is rejected (null).
+function cleanFee(v) {
+  if (v === '' || v === null) return 0;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 && n <= 1e9 ? n : null;
+}
 const hospitalSettings = (h) => {
   const base = CURRENCIES[h?.currency] ? h.currency : 'UGX';
   const stored = h?.settings?.exchangeRates || {};
@@ -262,6 +268,7 @@ const DoctorSchema = new mongoose.Schema({
   phone: String,
   email: String,
   status: String,
+  consultationFee: { type: Number, default: 0 }, // billed (in the hospital's main currency) when an appointment with this doctor is completed
   linkedUserId: String,
   createdAt: { type: String, default: () => new Date().toISOString() },
 });
@@ -291,6 +298,7 @@ const AppointmentSchema = new mongoose.Schema({
   date: String,
   time: String,
   status: { type: String, default: 'scheduled' },
+  billId: String,        // the consultation bill raised when the appointment was completed
   reason: String,
   notes: String,
   createdAt: { type: String, default: () => new Date().toISOString() },
@@ -387,6 +395,8 @@ const LabOrderSchema = new mongoose.Schema({
   }],
   status: { type: String, default: 'pending' }, // pending | in_progress | completed | cancelled
   totalAmount: { type: Number, default: 0 },
+  billId: String,        // the bill raised for this order (when the hospital uses billing)
+  billNumber: String,
   sampleCollectedAt: String,
   completedAt: String,
   processedById: String,
@@ -465,6 +475,8 @@ const BillSchema = new mongoose.Schema({
   id: { type: String, default: () => uuidv4() },
   hospitalId: { type: String },
   billNumber: String,
+  labOrderId: String,    // set when the bill was raised from a laboratory order
+  appointmentId: String, // set when the bill is a consultation fee for a completed appointment
   patientId: String,
   patientName: String,
   items: Array,
@@ -476,12 +488,22 @@ const BillSchema = new mongoose.Schema({
   createdAt: { type: String, default: () => new Date().toISOString() },
 });
 const Bill = mongoose.model('Bill', BillSchema);
+// One bill per appointment and one per lab order, enforced by the database itself: such a bill gets a
+// fixed _id ("consult:<appointment id>" / "lab:<order id>"), so a second insert for the same thing
+// is refused (E11000) even when two requests arrive at the same moment.
+async function insertOnceBill(fixedId, fields) {
+  const doc = new Bill(fields).toObject();
+  doc._id = fixedId;
+  await Bill.collection.insertOne(doc);
+  return doc;
+}
 
 const TransactionSchema = new mongoose.Schema({
   id: { type: String, default: () => uuidv4() },
   hospitalId: { type: String },
   txRef: String,
   billId: String,
+  pharmacySaleId: String,                      // set when the payment was taken at the pharmacy counter
   patientId: String,
   patientName: String,
   amount: { type: Number, default: 0 },       // always in the hospital's MAIN currency (so totals stay correct)
@@ -512,6 +534,7 @@ const PharmacySaleSchema = new mongoose.Schema({
     subtotal: Number,
   }],
   totalAmount: { type: Number, default: 0 },
+  transactionId: String,  // the payment recorded for this sale
   soldById: String,
   soldByName: String,
   notes: String,
@@ -1340,6 +1363,7 @@ app.post('/api/doctors', auth, requireRole(ADMIN), requireHospitalContext, async
       if (!u) return res.status(400).json({ error: 'The linked login account must be a doctor account of this hospital.', code: 'VALIDATION' });
     }
     const body = { ...req.body }; delete body._id;
+    if (body.consultationFee !== undefined) { const fee = cleanFee(body.consultationFee); if (fee === null) return res.status(400).json({ error: 'The consultation fee must be a number, zero or more.', code: 'VALIDATION' }); body.consultationFee = fee; }
     const d = new Doctor({ ...body, id: uuidv4(), hospitalId: req.user.hospitalId });
     await d.save(); res.json(d);
   } catch (err) { serverError(res, err); }
@@ -1350,6 +1374,7 @@ app.put('/api/doctors/:id', auth, requireRole(ADMIN), async (req, res) => {
     const update = { ...req.body }; delete update.hospitalId; delete update.id; delete update._id;
     const before = await Doctor.findOne({ id: req.params.id, ...scope(req) });
     if (!before) return res.status(404).json({ error: 'Not found' });
+    if (update.consultationFee !== undefined) { const fee = cleanFee(update.consultationFee); if (fee === null) return res.status(400).json({ error: 'The consultation fee must be a number, zero or more.', code: 'VALIDATION' }); update.consultationFee = fee; }
     const bad = await checkChoices(req, update, before); if (bad) return res.status(400).json({ error: bad, code: 'VALIDATION' });
     if (update.linkedUserId && update.linkedUserId !== before.linkedUserId) {
       const u = await User.findOne({ id: update.linkedUserId, ...scope(req), role: DOCTOR });
@@ -1453,8 +1478,38 @@ app.put('/api/appointments/:id', auth, requireRole(ADMIN, RECEPTIONIST, DOCTOR),
       if (!dc) return res.status(400).json({ error: 'That doctor was not found in this hospital.', code: 'VALIDATION' });
       update.doctorName = dc.name;
     }
+    // A bill is raised by the server only; it can never be set or cleared from the request.
+    delete update.billId;
     const a = await Appointment.findOneAndUpdate({ id: req.params.id, ...scope(req) }, update, { new: true });
     if (!a) return res.status(404).json({ error: 'Not found' });
+
+    // Completing an appointment bills the doctor's consultation fee, once.
+    try {
+      if (a.status === 'completed' && !a.billId && a.doctorId && a.patientId) {
+        const doc = await Doctor.findOne({ id: a.doctorId, hospitalId: a.hospitalId });
+        const fee = Number(doc?.consultationFee) || 0;
+        const hospital = fee > 0 ? await Hospital.findOne({ id: a.hospitalId }) : null;
+        if (fee > 0 && hospital?.features?.billing) {
+          const bill = await insertOnceBill(`consult:${a.id}`, {
+            id: uuidv4(),
+            hospitalId: a.hospitalId,
+            billNumber: `BILL-${String(await nextSeq(`bill:${a.hospitalId}`)).padStart(6, '0')}`,
+            appointmentId: a.id,
+            patientId: a.patientId,
+            patientName: a.patientName,
+            items: [{ description: `Consultation — ${doc.name}`, quantity: 1, unitPrice: fee, amount: fee }],
+            totalAmount: fee, paidAmount: 0, remainingAmount: fee, status: 'pending',
+            notes: `Appointment ${a.date || ''} ${a.time || ''}`.trim(),
+          });
+          await Appointment.updateOne({ id: a.id, hospitalId: a.hospitalId }, { $set: { billId: bill.id } });
+          a.billId = bill.id;
+        }
+      }
+    } catch (billErr) {
+      // E11000: a parallel request already billed this appointment — nothing more to do.
+      if (!(billErr && billErr.code === 11000)) console.error('Could not raise the consultation bill for appointment', a.id, billErr.message);
+      else { const fresh = await Appointment.findOne({ id: a.id, hospitalId: a.hospitalId }); if (fresh?.billId) a.billId = fresh.billId; }
+    }
     res.json(a);
   } catch (err) { serverError(res, err); }
 });
@@ -1661,7 +1716,33 @@ app.post('/api/lab-orders', auth, requireRole(ADMIN, DOCTOR), requireFeature('la
       totalAmount: tests.reduce((s, t) => s + t.price, 0),
       status: 'pending',
     });
-    await order.save(); res.json(order);
+    await order.save();
+
+    // Raise a bill for the priced tests so the money shows up in Billing and can be
+    // paid in Transactions. A billing hiccup must never lose the doctor's order.
+    try {
+      const hospital = await Hospital.findOne({ id: req.user.hospitalId });
+      if (hospital?.features?.billing && order.totalAmount > 0) {
+        const items = order.tests.filter(t => t.price > 0).map(t => ({ description: `Lab: ${t.name}`, quantity: 1, unitPrice: t.price, amount: t.price }));
+        const bill = await insertOnceBill(`lab:${order.id}`, {
+          id: uuidv4(),
+          hospitalId: req.user.hospitalId,
+          billNumber: `BILL-${String(await nextSeq(`bill:${req.user.hospitalId}`)).padStart(6, '0')}`,
+          labOrderId: order.id,
+          patientId: patient.id,
+          patientName: patient.name,
+          items,
+          totalAmount: order.totalAmount,
+          paidAmount: 0,
+          remainingAmount: order.totalAmount,
+          status: 'pending',
+          notes: `Laboratory order ${order.orderRef}`,
+        });
+        order.billId = bill.id; order.billNumber = bill.billNumber;
+        await order.save();
+      }
+    } catch (billErr) { console.error('Could not raise a bill for lab order', order.orderRef, billErr.message); }
+    res.json(order);
   } catch (err) { serverError(res, err); }
 });
 
@@ -1707,7 +1788,15 @@ app.put('/api/lab-orders/:id', auth, requireRole(ADMIN, LAB_STAFF), requireFeatu
       }
     }
 
-    await order.save(); res.json(order);
+    await order.save();
+
+    // A cancelled order that nobody has paid for should not leave an open bill behind.
+    if (order.status === 'cancelled' && order.billId) {
+      try {
+        await Bill.updateOne({ id: order.billId, hospitalId: order.hospitalId, paidAmount: { $lte: 0 }, status: 'pending' }, { $set: { status: 'cancelled', remainingAmount: 0 } });
+      } catch (e) { console.error('Could not cancel the bill of lab order', order.orderRef, e.message); }
+    }
+    res.json(order);
   } catch (err) { serverError(res, err); }
 });
 
@@ -2040,6 +2129,30 @@ app.post('/api/pharmacy-sales', auth, requireRole(ADMIN, PHARMACIST), requireFea
       soldByName: req.user.name,
     });
     await sale.save();
+
+    // The customer pays at the counter, so record the payment: it then shows in
+    // Transactions and in the hospital's revenue like every other payment.
+    try {
+      if (totalAmount > 0) {
+        const method = String(req.body.method || 'Cash').slice(0, 40) || 'Cash';
+        const tx = await new Transaction({
+          id: uuidv4(),
+          hospitalId: req.user.hospitalId,
+          txRef: `TXN-${String(await nextSeq(`tx:${req.user.hospitalId}`)).padStart(6, '0')}`,
+          pharmacySaleId: sale.id,
+          patientId: sale.patientId,
+          patientName: sale.patientName,
+          amount: totalAmount,
+          tenderedCurrency: hosp && CURRENCIES[hosp.currency] ? hosp.currency : undefined,
+          tenderedAmount: totalAmount,
+          exchangeRate: 1,
+          method,
+          note: `Pharmacy sale ${sale.saleRef}`,
+          recordedBy: req.user.name,
+        }).save();
+        sale.transactionId = tx.id; await sale.save();
+      }
+    } catch (txErr) { console.error('Could not record the payment of pharmacy sale', sale.saleRef, txErr.message); }
     res.json(sale);
   } catch (err) { serverError(res, err); }
 });
