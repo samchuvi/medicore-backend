@@ -38,28 +38,38 @@ function decrypt(file, passphrase) {
 }
 
 // ── Backblaze B2 (S3-compatible API) ─────────────────────────────────────────
+// Settings pasted into GitHub/Render often carry a stray space, line break, quote or
+// invisible character, which breaks the request signature. Strip all of them here.
+const clean = v => String(v == null ? '' : v).replace(/[^\x21-\x7E]/g, '').replace(/^["']+|["']+$/g, '');
+function b2Env(env = process.env) {
+  let endpoint = clean(env.B2_ENDPOINT).replace(/\/+$/, '');
+  if (endpoint && !/^https?:\/\//i.test(endpoint)) endpoint = 'https://' + endpoint;
+  return { endpoint, keyId: clean(env.B2_KEY_ID), appKey: clean(env.B2_APP_KEY), bucket: clean(env.B2_BUCKET) };
+}
 function b2Configured(env = process.env) {
-  return Boolean(env.B2_ENDPOINT && env.B2_KEY_ID && env.B2_APP_KEY && env.B2_BUCKET);
+  const c = b2Env(env);
+  return Boolean(c.endpoint && c.keyId && c.appKey && c.bucket);
 }
 function b2Client(env = process.env) {
   const { S3Client } = require('@aws-sdk/client-s3');
-  const region = (env.B2_ENDPOINT.match(/s3\.([^.]+)\.backblazeb2\.com/) || [])[1] || 'us-west-004';
+  const c = b2Env(env);
+  const region = (c.endpoint.match(/s3\.([^.]+)\.backblazeb2\.com/) || [])[1] || 'us-west-004';
   return new S3Client({
-    endpoint: env.B2_ENDPOINT, region, forcePathStyle: true,
-    credentials: { accessKeyId: env.B2_KEY_ID, secretAccessKey: env.B2_APP_KEY },
+    endpoint: c.endpoint, region, forcePathStyle: true,
+    credentials: { accessKeyId: c.keyId, secretAccessKey: c.appKey },
   });
 }
 const PREFIX = 'hms-backups/';
 
 async function b2Upload(key, buf, env = process.env) {
   const { PutObjectCommand } = require('@aws-sdk/client-s3');
-  await b2Client(env).send(new PutObjectCommand({ Bucket: env.B2_BUCKET, Key: PREFIX + key, Body: buf }));
+  await b2Client(env).send(new PutObjectCommand({ Bucket: b2Env(env).bucket, Key: PREFIX + key, Body: buf }));
 }
 async function b2List(env = process.env) {
   const { ListObjectsV2Command } = require('@aws-sdk/client-s3');
   const c = b2Client(env); const out = []; let token;
   do {
-    const r = await c.send(new ListObjectsV2Command({ Bucket: env.B2_BUCKET, Prefix: PREFIX, ContinuationToken: token }));
+    const r = await c.send(new ListObjectsV2Command({ Bucket: b2Env(env).bucket, Prefix: PREFIX, ContinuationToken: token }));
     (r.Contents || []).forEach(o => out.push({ key: o.Key, size: o.Size, modified: o.LastModified }));
     token = r.IsTruncated ? r.NextContinuationToken : undefined;
   } while (token);
@@ -67,12 +77,12 @@ async function b2List(env = process.env) {
 }
 async function b2Download(key, env = process.env) {
   const { GetObjectCommand } = require('@aws-sdk/client-s3');
-  const r = await b2Client(env).send(new GetObjectCommand({ Bucket: env.B2_BUCKET, Key: key }));
+  const r = await b2Client(env).send(new GetObjectCommand({ Bucket: b2Env(env).bucket, Key: key }));
   return Buffer.from(await r.Body.transformToByteArray());
 }
 async function b2Delete(key, env = process.env) {
   const { DeleteObjectCommand } = require('@aws-sdk/client-s3');
-  await b2Client(env).send(new DeleteObjectCommand({ Bucket: env.B2_BUCKET, Key: key }));
+  await b2Client(env).send(new DeleteObjectCommand({ Bucket: b2Env(env).bucket, Key: key }));
 }
 
 module.exports = { pack, unpack, encrypt, decrypt, b2Configured, b2Upload, b2List, b2Download, b2Delete, PREFIX };
