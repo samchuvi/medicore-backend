@@ -605,25 +605,49 @@ function requireFeature(featureKey) {
 const crypto = require('crypto');
 const idem = new Map(); // hash -> { state: 'running'|'done', status, body, at }
 setInterval(() => { const cut = Date.now() - 10 * 60 * 1000; for (const [k, v] of idem) if (v.at < cut) idem.delete(k); }, 60 * 1000).unref();
-app.use((req, res, next) => {
+// Offline-capable actions also send X-Durable: 1. Those are remembered in the database (not just in
+// memory), so a request replayed hours later, or after a server restart, still can't run twice.
+const durableCol = () => mongoose.connection.collection('idempotency');
+setInterval(() => { try { durableCol().deleteMany({ at: { $lt: new Date(Date.now() - 30 * 24 * 3600 * 1000) } }).catch(() => {}); } catch { /* not connected yet */ } }, 6 * 3600 * 1000).unref();
+const callerOf = (req) => { try { const t = String(req.headers.authorization || '').replace(/^Bearer\s+/i, ''); const p = JSON.parse(Buffer.from(t.split('.')[1], 'base64url').toString()); return `${p.hospitalId || ''}:${p.id || ''}`; } catch { return req.ip; } };
+app.use(async (req, res, next) => {
   const key = req.method === 'POST' && req.headers['idempotency-key'];
   if (!key || typeof key !== 'string' || key.length > 100) return next();
-  const h = crypto.createHash('sha256').update(`${req.headers.authorization || req.ip}|${req.path}|${key}`).digest('hex');
+  const durable = req.headers['x-durable'] === '1';
+  const h = crypto.createHash('sha256').update(`${durable ? callerOf(req) : (req.headers.authorization || req.ip)}|${req.path}|${key}`).digest('hex');
   const prev = idem.get(h);
   if (prev) {
     if (prev.state === 'running') return res.status(409).json({ error: 'This request is already being processed.', code: 'DUPLICATE_REQUEST' });
     res.set('Idempotent-Replay', 'true');
     return res.status(prev.status).json(prev.body);
   }
+  if (durable) {
+    try {
+      try { await durableCol().insertOne({ _id: h, state: 'running', at: new Date() }); }
+      catch (e) {
+        if (e && e.code !== 11000) throw e;
+        const doc = await durableCol().findOne({ _id: h });
+        if (doc && doc.state === 'done') { res.set('Idempotent-Replay', 'true'); return res.status(doc.status).json(doc.body); }
+        if (doc && Date.now() - new Date(doc.at).getTime() < 2 * 60 * 1000) return res.status(409).json({ error: 'This request is already being processed.', code: 'DUPLICATE_REQUEST' });
+        await durableCol().deleteOne({ _id: h, state: 'running' }); // a crashed attempt: let this one run
+        await durableCol().insertOne({ _id: h, state: 'running', at: new Date() });
+      }
+    } catch (e) { return res.status(503).json({ error: 'The server is busy. Please try again.', code: 'SERVER_DOWN' }); }
+  }
   idem.set(h, { state: 'running', at: Date.now() });
   const orig = res.json.bind(res);
   res.json = (body) => {
     // Failed attempts may be retried with the same key; only successes are replayed.
-    if (res.statusCode < 400) idem.set(h, { state: 'done', status: res.statusCode, body, at: Date.now() });
-    else idem.delete(h);
+    if (res.statusCode < 400) {
+      idem.set(h, { state: 'done', status: res.statusCode, body, at: Date.now() });
+      if (durable) durableCol().updateOne({ _id: h }, { $set: { state: 'done', status: res.statusCode, body, at: new Date() } }).catch(() => {});
+    } else {
+      idem.delete(h);
+      if (durable) durableCol().deleteOne({ _id: h }).catch(() => {});
+    }
     return orig(body);
   };
-  res.on('close', () => { const cur = idem.get(h); if (cur && cur.state === 'running') idem.delete(h); });
+  res.on('close', () => { const cur = idem.get(h); if (cur && cur.state === 'running') { idem.delete(h); if (durable) durableCol().deleteOne({ _id: h, state: 'running' }).catch(() => {}); } });
   next();
 });
 
