@@ -199,6 +199,21 @@ const sfx = Date.now().toString(36);
   r = await call('/stats', 'GET', null, SA); ok(r.s === 200 && r.j.revenueByCurrency && typeof r.j.revenueByCurrency === 'object', 'superadmin revenueByCurrency');
   r = await call('/hospitals/overview', 'GET', null, SA); ok(r.j.find(h => h.id === hCd.id).currency === 'CDF', 'overview has currency');
 
+  console.log('— deleting test hospitals');
+  const hDel = await mk('del' + sfx, 'UGX', 'UG'); await call(`/hospitals/${hDel.id}/admin`, 'POST', { username: 'boss', password: 'Password123!' }, SA);
+  const DL = (await login(hDel.slug, 'boss', 'Password123!')).j.token;
+  await call('/patients', 'POST', { name: 'To Vanish', age: 30, gender: 'male' }, DL);
+  r = await call('/hospitals/' + hDel.id, 'DELETE', { confirm: hDel.slug }, UG); ok(r.s === 403, 'admin cannot delete a hospital');
+  r = await call('/hospitals/' + hDel.id, 'DELETE', { confirm: hDel.slug }, SA); ok(r.s === 403 && r.j.code === 'NOT_TEST', 'real hospital cannot be deleted');
+  await call('/hospitals/' + hDel.id, 'PUT', { isTest: true }, SA);
+  r = await call('/hospitals/' + hDel.id, 'DELETE', { confirm: hDel.slug }, SA); ok(r.s === 400 && r.j.code === 'NOT_SUSPENDED', 'must be suspended first');
+  await call(`/hospitals/${hDel.id}/suspend`, 'POST', {}, SA);
+  r = await call('/hospitals/' + hDel.id, 'DELETE', { confirm: 'wrong' }, SA); ok(r.s === 400 && r.j.code === 'CONFIRM_MISMATCH', 'wrong code refused');
+  r = await call('/hospitals/' + hDel.id, 'DELETE', { confirm: hDel.slug }, SA); ok(r.s === 200 && r.j.removed.patients === 1, 'test hospital deleted');
+  r = await call('/hospitals', 'GET', null, SA); ok(!r.j.some(h => h.id === hDel.id), 'deleted hospital gone from list');
+  r = await login(hDel.slug, 'boss', 'Password123!'); ok(r.s === 401, 'deleted hospital staff cannot log in');
+  r = await call('/hospitals/overview', 'GET', null, SA); ok(r.j.every(h => typeof h.isTest === 'boolean'), 'overview reports isTest');
+
   console.log('— audit redaction & errors');
   await call('/users/' + doctorUser.id + '/password', 'PUT', { password: 'Secret-Value-1!' }, UG);
   r = await call('/audit-logs?limit=50', 'GET', null, SA); const txt = JSON.stringify(r.j); ok(!txt.includes('Secret-Value-1!') && !txt.includes('Password123!'), 'no passwords in audit trail');

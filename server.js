@@ -144,6 +144,8 @@ const HospitalSchema = new mongoose.Schema({
   currency: { type: String, default: 'UGX' }, // ISO code from CURRENCIES
   country: { type: String, default: 'UG' },
   status: { type: String, default: 'active' }, // active | suspended | trial
+  // Only hospitals marked as test hospitals can ever be deleted (see DELETE /api/hospitals/:id).
+  isTest: { type: Boolean, default: false },
   createdAt: { type: String, default: () => new Date().toISOString() },
 });
 const Hospital = mongoose.model('Hospital', HospitalSchema);
@@ -1002,6 +1004,43 @@ app.post('/api/hospitals/:id/resume', auth, requireRole(SUPERADMIN), async (req,
   } catch (err) { serverError(res, err); }
 });
 
+// Permanently delete a TEST hospital and everything in it. Guarded three ways:
+// the hospital must be marked as a test hospital, it must already be suspended,
+// and the caller must type its code. A copy of its data is saved first (in the
+// "hospital_archive" collection, which the nightly backup also covers); if that
+// copy fails, nothing is deleted. Real hospitals can never be deleted here.
+app.delete('/api/hospitals/:id', auth, requireRole(SUPERADMIN), async (req, res) => {
+  try {
+    const h = await Hospital.findOne({ id: req.params.id });
+    if (!h) return res.status(404).json({ error: 'Not found' });
+    if (!h.isTest) return res.status(403).json({ error: 'Only hospitals marked as test hospitals can be deleted. Suspend a real hospital instead.', code: 'NOT_TEST' });
+    if (h.status !== 'suspended') return res.status(400).json({ error: 'Suspend the hospital first, then delete it.', code: 'NOT_SUSPENDED' });
+    if (String((req.body || {}).confirm || '').toLowerCase().trim() !== h.slug)
+      return res.status(400).json({ error: 'Type the hospital code exactly to confirm.', code: 'CONFIRM_MISMATCH' });
+
+    const models = { users: User, patients: Patient, doctors: Doctor, staff: Staff, appointments: Appointment, medicalrecords: MedicalRecord,
+      treatmentplans: TreatmentPlan, referrals: Referral, laborders: LabOrder, wards: Ward, admissions: Admission,
+      inventories: Inventory, bills: Bill, transactions: Transaction, pharmacysales: PharmacySale };
+    const archive = mongoose.connection.collection('hospital_archive');
+    const deletedAt = new Date().toISOString();
+    const counts = {};
+    // 1) save a copy of everything (password hashes are left out) — abort if this fails
+    for (const [name, M] of Object.entries(models)) {
+      const docs = await M.find({ hospitalId: h.id }).lean();
+      counts[name] = docs.length;
+      if (!docs.length) continue;
+      if (name === 'users') docs.forEach(d => { delete d.password; });
+      await archive.insertOne({ hospitalId: h.id, slug: h.slug, name: h.name, collection: name, deletedAt, deletedBy: req.user.id, docs });
+    }
+    await archive.insertOne({ hospitalId: h.id, slug: h.slug, name: h.name, collection: 'hospital', deletedAt, deletedBy: req.user.id, docs: [h.toObject()] });
+    // 2) delete the data, then the hospital record last (so a retry is possible if something fails midway)
+    for (const M of Object.values(models)) await M.deleteMany({ hospitalId: h.id });
+    await Counter.deleteMany({ key: { $in: [`patient:${h.id}`, `bill:${h.id}`, `tx:${h.id}`] } });
+    await Hospital.deleteOne({ id: h.id });
+    res.json({ ok: true, removed: counts });
+  } catch (err) { serverError(res, err); }
+});
+
 // Convenience: create a hospital together with its first admin user in one
 // call, so onboarding a new customer is a single action.
 app.post('/api/hospitals/:id/admin', auth, requireRole(SUPERADMIN), async (req, res) => {
@@ -1052,6 +1091,7 @@ app.get('/api/hospitals/overview', auth, requireRole(SUPERADMIN), async (req, re
         name: h.name,
         slug: h.slug,
         status: h.status,
+        isTest: !!h.isTest,
         logo: h.logo,
         theme: h.theme,
         features: h.features,
